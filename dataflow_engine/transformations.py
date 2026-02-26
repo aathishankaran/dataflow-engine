@@ -457,16 +457,21 @@ class MainframeTransformationExecutor:
         error_bucket = (logic.get("error_bucket") or "").strip()
 
         # ── format → regex pattern map ──────────────────────────────────
+        # Both lowercase (legacy) and uppercase (new UI) forms are supported.
         FORMAT_PATTERNS: dict[str, str] = {
             "alpha":        r"^[A-Za-z\s]+$",
+            "ALPHA":        r"^[A-Za-z\s]+$",
             "numeric":      r"^\d+(\.\d+)?$",
+            "NUMERIC":      r"^\d+(\.\d+)?$",
             "alphanumeric": r"^[A-Za-z0-9\s]+$",
+            "ALPHANUMERIC": r"^[A-Za-z0-9\s]+$",
             "email":        r"^[^\s@]+@[^\s@]+\.[^\s@]+$",
+            "EMAIL":        r"^[^\s@]+@[^\s@]+\.[^\s@]+$",
         }
 
         # ── type → Spark cast type ───────────────────────────────────────
         from pyspark.sql.types import (
-            IntegerType, LongType, DoubleType, FloatType
+            IntegerType, LongType, DoubleType, FloatType, StringType
         )
         TYPE_CAST: dict = {
             "int":     IntegerType(),
@@ -477,6 +482,9 @@ class MainframeTransformationExecutor:
             "float":   FloatType(),
             "decimal": DoubleType(),
             "number":  DoubleType(),
+            # UI-facing simplified types (TEXT/NUMBER lowercased by engine)
+            "text":    StringType(),   # from UI 'TEXT'
+            # 'number' already maps above; 'date'/'timestamp' handled via to_date/to_timestamp
         }
 
         error_exprs: list = []   # each entry is a Column that yields an error
