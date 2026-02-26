@@ -1,0 +1,8 @@
+# PySpark Dataflow Framework
+# Python 3.9+
+
+# PySpark
+pyspark>=3.4.0
+
+# Mainframe EBCDIC support (optional, for cobol format inputs)
+# pip install spark-cobrix
