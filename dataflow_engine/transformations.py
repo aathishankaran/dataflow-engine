@@ -164,6 +164,8 @@ class MainframeTransformationExecutor:
                 result = self._apply_merge(logic, step)
             else:
                 result = source_df
+        elif step_type == "validate":
+            result = self._apply_validate(source_df, logic)
         elif step_type == "select":
             result = self._apply_select(source_df, logic)
         else:
@@ -425,3 +427,195 @@ class MainframeTransformationExecutor:
                     result = result.withColumn(target, F.lit(expr_str))
 
         return result
+
+    # ------------------------------------------------------------------
+    def _apply_validate(self, df: DataFrame, logic: dict) -> DataFrame:
+        """
+        Schema validation transformation.
+
+        Checks each field against its declared rule:
+          - data_type  : verifies the value can be cast to the expected type
+          - max_length : verifies len(value) <= max_length
+          - nullable   : when False, rejects null / empty-string values
+          - format     : pattern-based check —
+                          alpha        ^[A-Za-z\\s]+$
+                          numeric      ^\\d+(\\.\\d+)?$
+                          alphanumeric ^[A-Za-z0-9\\s]+$
+                          date         to_date(value, date_format) must not be null
+                          email        simple RFC-5321 shape
+                          regex        user-supplied pattern
+
+        fail_mode controls what happens when a row fails:
+          flag  (default) – adds ``_validation_errors`` (semicolon-joined messages)
+                            and ``_is_valid`` (boolean) to every row
+          drop            – returns only rows where all rules pass; invalid rows
+                            are silently discarded (count logged)
+          abort           – raises RuntimeError listing the first bad rows
+        """
+        rules     = logic.get("rules") or []
+        fail_mode = (logic.get("fail_mode") or "flag").lower()
+
+        # ── format → regex pattern map ──────────────────────────────────
+        FORMAT_PATTERNS: dict[str, str] = {
+            "alpha":        r"^[A-Za-z\s]+$",
+            "numeric":      r"^\d+(\.\d+)?$",
+            "alphanumeric": r"^[A-Za-z0-9\s]+$",
+            "email":        r"^[^\s@]+@[^\s@]+\.[^\s@]+$",
+        }
+
+        # ── type → Spark cast type ───────────────────────────────────────
+        from pyspark.sql.types import (
+            IntegerType, LongType, DoubleType, FloatType
+        )
+        TYPE_CAST: dict = {
+            "int":     IntegerType(),
+            "integer": IntegerType(),
+            "long":    LongType(),
+            "bigint":  LongType(),
+            "double":  DoubleType(),
+            "float":   FloatType(),
+            "decimal": DoubleType(),
+            "number":  DoubleType(),
+        }
+
+        error_exprs: list = []   # each entry is a Column that yields an error
+                                 # string or NULL when the check passes
+
+        for rule in rules:
+            field = (rule.get("field") or "").replace("-", "_")
+            if not field:
+                continue
+
+            col_name = _resolve_col(df, field)
+            if col_name not in df.columns:
+                LOG.warning("[VALIDATE] Field '%s' not in DataFrame — rule skipped.", field)
+                continue
+
+            col_ref    = F.col(col_name)
+            data_type  = (rule.get("data_type") or "string").lower()
+            max_length = rule.get("max_length")
+            nullable   = rule.get("nullable", True)   # True = null is allowed
+            fmt        = (rule.get("format") or "any").lower()
+            date_fmt   = rule.get("date_format") or rule.get("pattern") or "yyyy-MM-dd"
+            pattern    = rule.get("pattern") or ""
+
+            # 1. NULL / EMPTY check ──────────────────────────────────────
+            if not nullable:
+                error_exprs.append(
+                    F.when(
+                        col_ref.isNull() | (F.trim(col_ref.cast("string")) == ""),
+                        F.lit(f"'{field}' must not be null or empty")
+                    ).otherwise(F.lit(None).cast("string"))
+                )
+
+            # 2. DATA TYPE check ─────────────────────────────────────────
+            if data_type in TYPE_CAST:
+                cast_type = TYPE_CAST[data_type]
+                error_exprs.append(
+                    F.when(
+                        col_ref.isNotNull() & col_ref.cast(cast_type).isNull(),
+                        F.lit(f"'{field}' is not a valid {data_type}")
+                    ).otherwise(F.lit(None).cast("string"))
+                )
+            elif data_type == "date":
+                fmt_str = rule.get("date_format") or "yyyy-MM-dd"
+                error_exprs.append(
+                    F.when(
+                        col_ref.isNotNull() &
+                        F.to_date(col_ref.cast("string"), fmt_str).isNull(),
+                        F.lit(f"'{field}' is not a valid date (expected: {fmt_str})")
+                    ).otherwise(F.lit(None).cast("string"))
+                )
+            elif data_type == "timestamp":
+                fmt_str = rule.get("date_format") or "yyyy-MM-dd HH:mm:ss"
+                error_exprs.append(
+                    F.when(
+                        col_ref.isNotNull() &
+                        F.to_timestamp(col_ref.cast("string"), fmt_str).isNull(),
+                        F.lit(f"'{field}' is not a valid timestamp (expected: {fmt_str})")
+                    ).otherwise(F.lit(None).cast("string"))
+                )
+
+            # 3. MAX LENGTH check ────────────────────────────────────────
+            if max_length is not None:
+                try:
+                    ml = int(max_length)
+                    error_exprs.append(
+                        F.when(
+                            col_ref.isNotNull() &
+                            (F.length(col_ref.cast("string")) > ml),
+                            F.lit(f"'{field}' exceeds max length {ml}")
+                        ).otherwise(F.lit(None).cast("string"))
+                    )
+                except (ValueError, TypeError):
+                    LOG.warning("[VALIDATE] Invalid max_length '%s' for field '%s'.", max_length, field)
+
+            # 4. FORMAT check ─────────────────────────────────────────────
+            if fmt == "date":
+                fmt_str = date_fmt or "yyyy-MM-dd"
+                error_exprs.append(
+                    F.when(
+                        col_ref.isNotNull() &
+                        F.to_date(col_ref.cast("string"), fmt_str).isNull(),
+                        F.lit(f"'{field}' does not match date format '{fmt_str}'")
+                    ).otherwise(F.lit(None).cast("string"))
+                )
+            elif fmt == "regex" and pattern:
+                error_exprs.append(
+                    F.when(
+                        col_ref.isNotNull() &
+                        (~col_ref.cast("string").rlike(pattern)),
+                        F.lit(f"'{field}' does not match pattern '{pattern}'")
+                    ).otherwise(F.lit(None).cast("string"))
+                )
+            elif fmt in FORMAT_PATTERNS:
+                pat = FORMAT_PATTERNS[fmt]
+                error_exprs.append(
+                    F.when(
+                        col_ref.isNotNull() &
+                        (~col_ref.cast("string").rlike(pat)),
+                        F.lit(f"'{field}' is not a valid {fmt} value")
+                    ).otherwise(F.lit(None).cast("string"))
+                )
+
+        # ── No rules → pass through with metadata columns ───────────────
+        if not error_exprs:
+            LOG.info("[VALIDATE] No rules defined; passing through with _is_valid=True.")
+            return (df
+                    .withColumn("_is_valid", F.lit(True))
+                    .withColumn("_validation_errors", F.lit("").cast("string")))
+
+        # ── Combine all rule errors into a single string (concat_ws ignores NULLs) ──
+        errors_col   = F.concat_ws("; ", *error_exprs)
+        is_valid_col = (F.length(errors_col) == 0)
+
+        if fail_mode == "drop":
+            valid_df      = df.filter(is_valid_col)
+            invalid_count = df.filter(~is_valid_col).count()
+            LOG.info("[VALIDATE] drop mode: %d invalid row(s) removed.", invalid_count)
+            return valid_df
+
+        # Build annotated DataFrame for flag / abort
+        annotated = (df
+                     .withColumn("_validation_errors", errors_col)
+                     .withColumn("_is_valid", is_valid_col))
+
+        if fail_mode == "abort":
+            invalid_count = annotated.filter(~F.col("_is_valid")).count()
+            if invalid_count > 0:
+                samples = (annotated
+                           .filter(~F.col("_is_valid"))
+                           .select("_validation_errors")
+                           .limit(5)
+                           .collect())
+                msgs = [r["_validation_errors"] for r in samples]
+                raise RuntimeError(
+                    f"[VALIDATE] Schema validation failed: {invalid_count} invalid row(s). "
+                    f"First errors: {msgs}"
+                )
+            # All rows valid — return without extra columns
+            return df
+
+        # Default: flag — return annotated DataFrame
+        LOG.info("[VALIDATE] flag mode: validation columns _is_valid, _validation_errors added.")
+        return annotated
