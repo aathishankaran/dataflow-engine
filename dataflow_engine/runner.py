@@ -86,15 +86,101 @@ class DataFlowRunner:
                 df = df.toDF(*normalized)
             return df
         if fmt == "fixed":
-            from pyspark.sql.types import StructType, StructField, StringType
-            fields = cfg.get("fields") or []
-            schema = StructType([StructField(f.get("name", f"col_{i}").replace("-", "_"), StringType(), True) for i, f in enumerate(fields)]) if fields else StructType([StructField("value", StringType(), True)])
-            return self.spark.read.schema(schema).text(path)
+            return self._read_fixed_width(name, cfg, path)
+
 
         try:
             return self.spark.read.parquet(path)
         except Exception:
             return self.spark.read.option("header", "true").option("inferSchema", "true").csv(path)
+
+    def _read_fixed_width(self, name: str, cfg: dict, path: str) -> "DataFrame":
+        """
+        Read a fixed-width (positional) flat file and extract named columns.
+
+        Config fields used:
+          fields        – list of {name, type, start (1-based), length} dicts
+          header_count  – number of header lines to skip at top of file (default 0)
+          trailer_count – number of trailer lines to skip at bottom of file (default 0)
+          record_length – optional expected record width; logs a warning when exceeded
+          count_file_path – optional path to a control file whose first line is the
+                            expected data-record count; a mismatch triggers a warning.
+        """
+        from pyspark.sql import functions as F
+
+        fields        = cfg.get("fields") or []
+        header_count  = int(cfg.get("header_count")  or 0)
+        trailer_count = int(cfg.get("trailer_count") or 0)
+        record_length = cfg.get("record_length")
+        count_file_path = cfg.get("count_file_path") or ""
+
+        # ── 1. Read all lines as raw text ────────────────────────────────
+        raw_rdd = self.spark.read.text(path).rdd   # Row(value=str)
+
+        # ── 2. Skip header / trailer lines using zipWithIndex ────────────
+        if header_count > 0 or trailer_count > 0:
+            indexed_rdd = raw_rdd.zipWithIndex()          # (Row, idx)
+            total_lines = indexed_rdd.count()
+            keep_from   = header_count
+            keep_to     = total_lines - trailer_count     # exclusive upper bound
+            LOG.info(
+                "[FIXED] %s: total_lines=%d  skip_header=%d  skip_trailer=%d  keep=[%d, %d)",
+                name, total_lines, header_count, trailer_count, keep_from, keep_to,
+            )
+            filtered_rdd = (
+                indexed_rdd
+                .filter(lambda xi: keep_from <= xi[1] < keep_to)
+                .map(lambda xi: xi[0])   # drop index, keep original Row
+            )
+        else:
+            filtered_rdd = raw_rdd
+
+        raw_df = self.spark.createDataFrame(filtered_rdd, ["value"])
+
+        # ── 3. Optional: validate record width ───────────────────────────
+        if record_length:
+            rl = int(record_length)
+            too_wide = raw_df.filter(F.length(F.col("value")) > rl).count()
+            if too_wide:
+                LOG.warning(
+                    "[FIXED] %s: %d record(s) exceed expected record_length=%d",
+                    name, too_wide, rl,
+                )
+
+        # ── 4. Extract columns by start / length positions ────────────────
+        if fields:
+            select_exprs = []
+            for i, f in enumerate(fields):
+                col_name = (f.get("name") or f"col_{i}").replace("-", "_")
+                start    = int(f.get("start")  or 1)   # 1-based (Spark substring is 1-based)
+                length   = int(f.get("length") or 1)
+                select_exprs.append(
+                    F.trim(F.substring(F.col("value"), start, length)).alias(col_name)
+                )
+            df = raw_df.select(*select_exprs)
+        else:
+            # No field definitions — return raw lines
+            df = raw_df
+
+        # ── 5. Optional: validate record count against control file ───────
+        if count_file_path:
+            try:
+                count_text = self.spark.read.text(count_file_path).first()
+                if count_text:
+                    expected = int(count_text["value"].strip())
+                    actual   = df.count()
+                    if actual != expected:
+                        LOG.warning(
+                            "[FIXED] %s: count mismatch — count_file=%d  actual_records=%d",
+                            name, expected, actual,
+                        )
+                    else:
+                        LOG.info("[FIXED] %s: record count validated (%d)", name, actual)
+            except Exception as ce:
+                LOG.warning("[FIXED] %s: could not read count_file_path '%s': %s", name, count_file_path, ce)
+
+        LOG.info("[FIXED] %s: loaded %d columns from %s", name, len(fields) if fields else 1, path)
+        return df
 
     def _output_columns_from_config(self, cfg: dict, df: DataFrame) -> list[str] | None:
         """Return list of column names to write, from output config fields (copybook). Skips group-level names like SUMMARY_REC."""
