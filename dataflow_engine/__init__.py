@@ -7,5 +7,12 @@ Reads generated config JSON and executes dataflow with full mainframe keyword
 
 from .runner import DataFlowRunner
 from .transformations import MainframeTransformationExecutor, apply_transformation_step
+from .incident import MoogsoftIncidentConnector, IncidentCreationError
 
-__all__ = ["DataFlowRunner", "MainframeTransformationExecutor", "apply_transformation_step"]
+__all__ = [
+    "DataFlowRunner",
+    "MainframeTransformationExecutor",
+    "apply_transformation_step",
+    "MoogsoftIncidentConnector",
+    "IncidentCreationError",
+]

@@ -431,7 +431,7 @@ class MainframeTransformationExecutor:
     # ------------------------------------------------------------------
     def _apply_validate(self, df: DataFrame, logic: dict) -> DataFrame:
         """
-        Schema validation transformation.
+        Data validation transformation.
 
         Checks each field against its declared rule:
           - data_type  : verifies the value can be cast to the expected type
@@ -452,8 +452,9 @@ class MainframeTransformationExecutor:
                             are silently discarded (count logged)
           abort           – raises RuntimeError listing the first bad rows
         """
-        rules     = logic.get("rules") or []
-        fail_mode = (logic.get("fail_mode") or "flag").lower()
+        rules        = logic.get("rules") or []
+        fail_mode    = (logic.get("fail_mode") or "flag").lower()
+        error_bucket = (logic.get("error_bucket") or "").strip()
 
         # ── format → regex pattern map ──────────────────────────────────
         FORMAT_PATTERNS: dict[str, str] = {
@@ -591,8 +592,23 @@ class MainframeTransformationExecutor:
 
         if fail_mode == "drop":
             valid_df      = df.filter(is_valid_col)
-            invalid_count = df.filter(~is_valid_col).count()
+            invalid_df    = df.filter(~is_valid_col)
+            invalid_count = invalid_df.count()
             LOG.info("[VALIDATE] drop mode: %d invalid row(s) removed.", invalid_count)
+            if error_bucket and invalid_count > 0:
+                # Annotate invalid rows with error details before writing to the error bucket
+                invalid_annotated = (invalid_df
+                                     .withColumn("_validation_errors",
+                                                 F.concat_ws("; ", *error_exprs))
+                                     .withColumn("_is_valid", F.lit(False)))
+                (invalid_annotated
+                 .write
+                 .mode("append")
+                 .parquet(error_bucket))
+                LOG.info(
+                    "[VALIDATE] Wrote %d invalid row(s) to error bucket: %s",
+                    invalid_count, error_bucket
+                )
             return valid_df
 
         # Build annotated DataFrame for flag / abort
@@ -610,7 +626,7 @@ class MainframeTransformationExecutor:
                            .collect())
                 msgs = [r["_validation_errors"] for r in samples]
                 raise RuntimeError(
-                    f"[VALIDATE] Schema validation failed: {invalid_count} invalid row(s). "
+                    f"[VALIDATE] Data validation failed: {invalid_count} invalid row(s). "
                     f"First errors: {msgs}"
                 )
             # All rows valid — return without extra columns
