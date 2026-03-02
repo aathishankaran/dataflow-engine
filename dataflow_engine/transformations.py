@@ -9,13 +9,560 @@ is stored by output_alias for the next step.
 """
 
 import logging
+import os
 import re
+import shutil
+from pathlib import Path
 from typing import Any
 
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
+from .oracle_loader import write_df_to_oracle  # noqa: E402 — imported after std-lib
 
 LOG = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Protocol helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _is_s3_path(path: str) -> bool:
+    """Return True if the path refers to an S3 location."""
+    return path.startswith("s3://") or path.startswith("s3a://") or path.startswith("s3n://")
+
+
+def _write_df_to_path(df: DataFrame, path: str, mode: str = "append", file_name: str = "") -> None:
+    """Write a Spark DataFrame to path.
+
+    When *file_name* is provided the DataFrame is coalesced to a single
+    partition, written to a temporary staging directory, and the resulting
+    part-file is renamed to *file_name* inside *path*.  The staging directory
+    and all Spark artefacts (_SUCCESS, etc.) are removed automatically,
+    leaving only the single named file.
+
+    When *file_name* is absent the DataFrame is written as Parquet (original
+    behaviour, preserved for backward compatibility).
+    """
+    actual_path = path
+    if actual_path.startswith("file://"):
+        actual_path = actual_path[7:]   # strip leading file://
+
+    if file_name and not _is_s3_path(actual_path):
+        # ── Local single-file write (named DAT/output file) ──────────────────
+        import platform as _platform
+        local_dir = Path(actual_path)
+        local_dir.mkdir(parents=True, exist_ok=True)
+        # Unique temp dir name derived from the target file name
+        tmp_dir = local_dir / ("_val_tmp_" + file_name.replace(".", "_"))
+        if tmp_dir.exists():
+            shutil.rmtree(str(tmp_dir))
+        tmp_path_str = str(tmp_dir)
+        if _platform.system().lower() == "windows":
+            tmp_path_str = tmp_path_str.replace("\\", "/")
+        # Write pipe-delimited text (no header) — produces exactly the data rows
+        (df.coalesce(1)
+           .write.mode("overwrite")
+           .option("header", "false")
+           .option("sep", "|")
+           .csv(tmp_path_str))
+        part_files = sorted(tmp_dir.glob("part-*.csv"))
+        if not part_files:
+            raise RuntimeError(
+                f"[VALIDATE_WRITE] No CSV part file found in temp dir '{tmp_dir}'"
+            )
+        dest_file = local_dir / file_name
+        shutil.move(str(part_files[0]), str(dest_file))
+        shutil.rmtree(str(tmp_dir))
+        LOG.info("[VALIDATE_WRITE] Written '%s' to '%s'.", file_name, actual_path)
+
+    elif file_name and _is_s3_path(actual_path):
+        # ── S3: write to staging prefix (single-file rename not yet wired) ───
+        tmp_s3 = actual_path.rstrip("/") + "/_val_tmp_" + file_name.replace(".", "_")
+        (df.coalesce(1)
+           .write.mode("overwrite")
+           .option("header", "false")
+           .option("sep", "|")
+           .csv(tmp_s3))
+        LOG.warning(
+            "[VALIDATE_WRITE] S3 single-file rename not yet implemented; "
+            "data written to temporary prefix '%s'.", tmp_s3
+        )
+
+    else:
+        # ── Original behaviour: Parquet directory write ───────────────────────
+        df.write.mode(mode).parquet(actual_path)
+
+
+def _write_fixed_width_to_path(
+    df: "DataFrame",
+    fields: list[dict],
+    path: str,
+    file_name: str,
+    record_length: int = 0,
+) -> None:
+    """
+    Write a Spark DataFrame as a single named fixed-width flat file.
+
+    Mirrors the fixed-width formatting logic in DataFlowRunner._write_fixed_width()
+    so that validated / error outputs use the exact same layout as the source input
+    or curated output without requiring a dependency on the runner class.
+
+    Each entry in *fields* must have at minimum:
+        {"name": "TXN-ID", "type": "string", "length": 10}
+
+    A staging temp-dir is used so the result is a single named file with no
+    Spark artefacts (_SUCCESS, part-* files) in the destination directory.
+    """
+    actual_path = path
+    if actual_path.startswith("file://"):
+        actual_path = actual_path[7:]
+
+    if not fields:
+        LOG.warning(
+            "[FIXED_WRITE] No field definitions provided; cannot write fixed-width "
+            "file '%s' at '%s'. Skipping.", file_name, actual_path
+        )
+        return
+
+    # ── Build a single fixed-width string column ──────────────────────────────
+    line_expr = None
+    for f in fields:
+        col_name = (f.get("name") or "").replace("-", "_")
+        length   = int(f.get("length") or 1)
+        ftype    = (f.get("type") or "string").lower()
+
+        if col_name not in df.columns:
+            # Column not present (e.g. annotation columns on error df) — pad blanks
+            piece = F.lpad(F.lit(""), length, " ")
+        elif ftype in ("int", "integer", "long", "bigint", "double",
+                       "float", "decimal", "number"):
+            # Numeric: right-justify, truncate if too long
+            piece = F.rpad(
+                F.substring(F.lpad(F.col(col_name).cast("string"), length, " "), 1, length),
+                length, " ",
+            )
+        else:
+            # String: left-justify, pad / truncate to declared length
+            piece = F.rpad(F.substring(F.col(col_name).cast("string"), 1, length), length, " ")
+
+        line_expr = piece if line_expr is None else F.concat(line_expr, piece)
+
+    if line_expr is None:
+        LOG.warning("[FIXED_WRITE] All field expressions were None; skipping write of '%s'.", file_name)
+        return
+
+    if record_length > 0:
+        line_expr = F.rpad(F.substring(line_expr, 1, record_length), record_length, " ")
+
+    df_fixed = df.select(line_expr.alias("value"))
+
+    # ── Write as a single named file using staging + rename ───────────────────
+    if _is_s3_path(actual_path):
+        tmp_s3 = actual_path.rstrip("/") + "/_fw_tmp_" + file_name.replace(".", "_")
+        df_fixed.coalesce(1).write.mode("overwrite").text(tmp_s3)
+        LOG.warning(
+            "[FIXED_WRITE] S3 single-file rename not yet implemented; "
+            "data written to staging prefix '%s'.", tmp_s3
+        )
+    else:
+        import platform as _platform
+        local_dir = Path(actual_path)
+        local_dir.mkdir(parents=True, exist_ok=True)
+        tmp_dir = local_dir / ("_fw_tmp_" + file_name.replace(".", "_"))
+        if tmp_dir.exists():
+            shutil.rmtree(str(tmp_dir))
+        tmp_path_str = str(tmp_dir)
+        if _platform.system().lower() == "windows":
+            tmp_path_str = tmp_path_str.replace("\\", "/")
+
+        df_fixed.coalesce(1).write.mode("overwrite").text(tmp_path_str)
+
+        # Find the part file Spark produced (no extension for text output)
+        part_files = sorted(
+            p for p in tmp_dir.glob("part-*")
+            if not p.name.startswith(".") and not p.suffix == ".crc"
+        )
+        if not part_files:
+            shutil.rmtree(str(tmp_dir))
+            raise RuntimeError(
+                f"[FIXED_WRITE] No part file found in temp dir '{tmp_dir}'"
+            )
+        dest_file = local_dir / file_name
+        shutil.move(str(part_files[0]), str(dest_file))
+        shutil.rmtree(str(tmp_dir))
+        LOG.info("[FIXED_WRITE] Fixed-width file written to '%s'.", dest_file)
+
+
+def _copy_file_to_dir(src: str, dest_dir: str) -> None:
+    """
+    Copy a single control file to dest_dir.
+
+    - If dest_dir is an S3 path and boto3 is available the file is uploaded.
+    - Otherwise a local shutil copy is performed.
+    - Errors are logged as warnings (non-fatal).
+    """
+    if not src or not dest_dir:
+        return
+    try:
+        filename = Path(src).name if not _is_s3_path(src) else src.rstrip("/").split("/")[-1]
+        if _is_s3_path(dest_dir):
+            # ── S3 destination via boto3 ────────────────────────────────────
+            try:
+                import boto3  # type: ignore
+                s3 = boto3.client("s3")
+                # Parse bucket and key from dest_dir
+                dest_no_proto = dest_dir.replace("s3a://", "").replace("s3n://", "").replace("s3://", "")
+                bucket, _, prefix = dest_no_proto.partition("/")
+                dest_key = (prefix.rstrip("/") + "/" + filename) if prefix else filename
+                if _is_s3_path(src):
+                    # S3 → S3 copy
+                    src_no_proto = src.replace("s3a://", "").replace("s3n://", "").replace("s3://", "")
+                    src_bucket, _, src_key = src_no_proto.partition("/")
+                    s3.copy_object(
+                        CopySource={"Bucket": src_bucket, "Key": src_key},
+                        Bucket=bucket, Key=dest_key,
+                    )
+                else:
+                    # Local → S3
+                    s3.upload_file(src, bucket, dest_key)
+                LOG.info("[COPY_FILE] Copied control file %s → s3://%s/%s", src, bucket, dest_key)
+            except ImportError:
+                LOG.warning("[COPY_FILE] boto3 not installed; cannot copy control file to S3 path %s", dest_dir)
+        else:
+            # ── Local destination ──────────────────────────────────────────
+            local_dest = dest_dir.replace("file://", "")
+            os.makedirs(local_dest, exist_ok=True)
+            dest_file = str(Path(local_dest) / filename)
+            if _is_s3_path(src):
+                LOG.warning("[COPY_FILE] Cannot copy from S3 src %s to local dest %s without boto3 streaming", src, local_dest)
+            else:
+                shutil.copy2(src, dest_file)
+                LOG.info("[COPY_FILE] Copied control file %s → %s", src, dest_file)
+    except Exception as exc:
+        LOG.warning("[COPY_FILE] Failed to copy control file '%s' to '%s': %s", src, dest_dir, exc)
+
+
+def _check_file_exists(path: str) -> bool:
+    """
+    Return True if the file at *path* exists, False otherwise.
+    Supports local paths and S3 (s3://, s3a://, s3n://) paths.
+    """
+    if not path:
+        return False
+    if _is_s3_path(path):
+        try:
+            import boto3  # type: ignore
+            s3 = boto3.client("s3")
+            no_proto = (path
+                        .replace("s3a://", "")
+                        .replace("s3n://", "")
+                        .replace("s3://", ""))
+            bucket, _, key = no_proto.partition("/")
+            if not key:
+                LOG.warning("[FILE_CHECK] No object key found in S3 path: %s", path)
+                return False
+            s3.head_object(Bucket=bucket, Key=key)
+            return True
+        except ImportError:
+            LOG.warning("[FILE_CHECK] boto3 not installed; cannot check S3 file: %s", path)
+            return False
+        except Exception:
+            return False
+    else:
+        local_path = path.replace("file://", "")
+        return os.path.isfile(local_path)
+
+
+def _raise_input_file_missing_incident(
+    pipeline_name: str,
+    input_name: str,
+    file_path: str,
+) -> None:
+    """
+    Fire a CRITICAL ServiceNow incident when a required input file is missing.
+    Silently no-ops when MOOGSOFT_ENDPOINT / MOOGSOFT_API_KEY are not configured.
+    The job must still be aborted by the caller after this function returns.
+
+    Set MOOGSOFT_DRY_RUN=true to simulate incident creation for testing.
+    """
+    endpoint = os.environ.get("MOOGSOFT_ENDPOINT", "")
+    api_key  = os.environ.get("MOOGSOFT_API_KEY", "")
+    dry_run  = os.environ.get("MOOGSOFT_DRY_RUN", "").strip().lower() in ("1", "true", "yes")
+
+    # ── Dry-run / test mode ──────────────────────────────────────────────────
+    if dry_run:
+        import uuid
+        simulated_key = f"DRY-RUN-{uuid.uuid4().hex[:8].upper()}"
+        LOG.info(
+            "[INCIDENT] ServiceNow incident created (dry-run mode) — "
+            "pipeline='%s' input='%s' missing_file='%s' alert_key=%s",
+            pipeline_name, input_name, file_path, simulated_key,
+        )
+        return
+
+    # ── No credentials configured ────────────────────────────────────────────
+    if not endpoint or not api_key:
+        LOG.warning(
+            "[INCIDENT] Input file missing for pipeline '%s' input '%s', "
+            "but MOOGSOFT_ENDPOINT / MOOGSOFT_API_KEY are not set — "
+            "ServiceNow incident was NOT created.  "
+            "Set these environment variables to enable automated incident creation.  "
+            "To test incident logging without real credentials set MOOGSOFT_DRY_RUN=true.",
+            pipeline_name, input_name,
+        )
+        return
+
+    # ── Real incident creation ───────────────────────────────────────────────
+    try:
+        from .incident import MoogsoftIncidentConnector
+        connector = MoogsoftIncidentConnector(endpoint=endpoint, api_key=api_key)
+        alert_key = connector.create_input_file_missing_incident(
+            pipeline_name=pipeline_name,
+            input_name=input_name,
+            file_path=file_path,
+        )
+        LOG.info(
+            "[INCIDENT] ServiceNow incident created — "
+            "pipeline='%s' input='%s' missing_file='%s' alert_key=%s",
+            pipeline_name, input_name, file_path, alert_key,
+        )
+    except Exception as exc:
+        LOG.warning("[INCIDENT] Failed to create input-file-missing incident: %s", exc)
+
+
+def _raise_last_run_file_missing_incident(
+    pipeline_name: str,
+    step_id: str,
+    file_path: str,
+    partition_column: str,
+) -> None:
+    """
+    Fire a ServiceNow incident when the last run date file is missing.
+    Silently no-ops when MOOGSOFT_ENDPOINT / MOOGSOFT_API_KEY are not configured.
+
+    Set MOOGSOFT_DRY_RUN=true to simulate incident creation for testing.
+    """
+    endpoint = os.environ.get("MOOGSOFT_ENDPOINT", "")
+    api_key  = os.environ.get("MOOGSOFT_API_KEY", "")
+    dry_run  = os.environ.get("MOOGSOFT_DRY_RUN", "").strip().lower() in ("1", "true", "yes")
+
+    # ── Dry-run / test mode ──────────────────────────────────────────────────
+    if dry_run:
+        import uuid
+        simulated_key = f"DRY-RUN-{uuid.uuid4().hex[:8].upper()}"
+        LOG.info(
+            "[INCIDENT] ServiceNow incident created (dry-run mode) — "
+            "pipeline='%s' step='%s' missing_file='%s' alert_key=%s",
+            pipeline_name, step_id, file_path, simulated_key,
+        )
+        return
+
+    # ── No credentials configured ────────────────────────────────────────────
+    if not endpoint or not api_key:
+        LOG.warning(
+            "[INCIDENT] Last run file missing for pipeline '%s' step '%s', "
+            "but MOOGSOFT_ENDPOINT / MOOGSOFT_API_KEY are not set — "
+            "ServiceNow incident was NOT created.  "
+            "Set these environment variables to enable automated incident creation.  "
+            "To test incident logging without real credentials set MOOGSOFT_DRY_RUN=true.",
+            pipeline_name, step_id,
+        )
+        return
+
+    # ── Real incident creation ───────────────────────────────────────────────
+    try:
+        from .incident import MoogsoftIncidentConnector
+        connector = MoogsoftIncidentConnector(endpoint=endpoint, api_key=api_key)
+        alert_key = connector.create_last_run_file_missing_incident(
+            pipeline_name=pipeline_name,
+            step_id=step_id,
+            file_path=file_path,
+            partition_column=partition_column,
+        )
+        LOG.info(
+            "[INCIDENT] ServiceNow incident created — "
+            "pipeline='%s' step='%s' missing_file='%s' alert_key=%s",
+            pipeline_name, step_id, file_path, alert_key,
+        )
+    except Exception as exc:
+        LOG.warning("[INCIDENT] Failed to create last-run-file-missing incident: %s", exc)
+
+
+def _create_ctrl_file(
+    df: "DataFrame",
+    ctrl_file_fields: list[dict],
+    ctrl_output_path: str,
+    step_id: str = "validate",
+    ctrl_file_name: str = "",
+) -> None:
+    """
+    Compute control file field values from PySpark expressions and write
+    the result as a single-row CSV.
+
+    Each entry in *ctrl_file_fields* is::
+
+        {"name": "RECORD_COUNT", "type": "INTEGER", "expression": "count(*)"}
+
+    Supported expression forms:
+    - Aggregation   : ``count(*)``, ``sum(amount)``, ``max(date_col)``
+    - Scalar/literal: ``current_date()``, ``'FILENAME.DAT'``, ``42``
+    - Column ref    : ``status_code`` (single column value — uses first row)
+
+    The function evaluates every expression via PySpark's ``F.expr()`` inside a
+    single ``.agg()`` call so only one Spark action is triggered.
+
+    When *ctrl_file_name* is provided, a single named file is written to
+    ``ctrl_output_path/<ctrl_file_name>``.  Otherwise the result is written
+    as a Spark CSV directory directly into *ctrl_output_path*.
+    """
+    if not ctrl_file_fields:
+        LOG.debug("[CTRL_FILE:%s] No ctrl_file_fields defined; skipping control file creation.", step_id)
+        return
+    if not ctrl_output_path:
+        LOG.warning("[CTRL_FILE:%s] ctrl_output_path is empty; skipping control file creation.", step_id)
+        return
+
+    LOG.info("[CTRL_FILE:%s] Creating control file at '%s' with %d field(s)%s.",
+             step_id, ctrl_output_path, len(ctrl_file_fields),
+             f" → '{ctrl_file_name}'" if ctrl_file_name else "")
+
+    try:
+        agg_exprs = []
+        for field_def in ctrl_file_fields:
+            name       = (field_def.get("name") or "").strip()
+            expression = (field_def.get("expression") or "").strip()
+            if not name or not expression:
+                LOG.debug("[CTRL_FILE:%s] Skipping field with missing name or expression: %s", step_id, field_def)
+                continue
+            agg_exprs.append(F.expr(expression).alias(name))
+
+        if not agg_exprs:
+            LOG.warning("[CTRL_FILE:%s] No valid field expressions found; skipping control file.", step_id)
+            return
+
+        ctrl_df = df.agg(*agg_exprs)
+
+        # Resolve actual path (strip file:// prefix for local paths)
+        actual_path = ctrl_output_path
+        if actual_path.startswith("file://"):
+            actual_path = actual_path[7:]
+
+        import platform as _platform
+        os_name = _platform.system().lower()   # 'linux', 'darwin', 'windows'
+
+        if ctrl_file_name:
+            # ── Write a single named file ──────────────────────────────────
+            if _is_s3_path(actual_path):
+                # S3: coalesce to 1, write to a temp prefix, then copy to the
+                # final key.  Requires Hadoop FS or boto3 — log a warning for now.
+                tmp_s3 = actual_path.rstrip("/") + "/_ctrl_tmp_" + step_id
+                ctrl_df.coalesce(1).write.mode("overwrite").option("header", "true").csv(tmp_s3)
+                LOG.warning(
+                    "[CTRL_FILE:%s] S3 single-file rename not yet implemented; "
+                    "control file is in temporary prefix '%s'.",
+                    step_id, tmp_s3
+                )
+            else:
+                # Local FS: write to a temp sub-directory, then rename the
+                # Spark part-file to the desired filename.
+                local_dir = Path(actual_path)
+                local_dir.mkdir(parents=True, exist_ok=True)
+                tmp_dir = local_dir / ("_ctrl_tmp_" + step_id)
+                # Remove any leftover temp dir from a previous run
+                if tmp_dir.exists():
+                    shutil.rmtree(str(tmp_dir))
+                tmp_path_str = str(tmp_dir)
+                if os_name == "windows":
+                    tmp_path_str = tmp_path_str.replace("\\", "/")
+                ctrl_df.coalesce(1).write.mode("overwrite").option("header", "true").csv(tmp_path_str)
+                # Locate the CSV part file produced by Spark
+                part_files = sorted(tmp_dir.glob("part-*.csv"))
+                if not part_files:
+                    raise RuntimeError(
+                        f"[CTRL_FILE:{step_id}] No CSV part file found in temp dir '{tmp_dir}'"
+                    )
+                dest_file = local_dir / ctrl_file_name
+                shutil.move(str(part_files[0]), str(dest_file))
+                # Clean up the temp directory (SUCCESS markers, etc.)
+                shutil.rmtree(str(tmp_dir))
+                LOG.info("[CTRL_FILE:%s] Control file written to '%s'.", step_id, dest_file)
+        else:
+            # ── Write Spark CSV directory (original behaviour) ─────────────
+            if _is_s3_path(actual_path):
+                ctrl_df.coalesce(1).write.mode("overwrite").option("header", "true").csv(actual_path)
+            else:
+                local_dir = Path(actual_path)
+                local_dir.mkdir(parents=True, exist_ok=True)
+                ctrl_df.coalesce(1).write.mode("overwrite").option("header", "true").csv(
+                    actual_path if os_name != "windows"
+                    else actual_path.replace("\\", "/")
+                )
+            LOG.info("[CTRL_FILE:%s] Control file written to '%s'.", step_id, ctrl_output_path)
+
+    except Exception as exc:
+        LOG.error("[CTRL_FILE:%s] Failed to create control file: %s", step_id, exc)
+        raise RuntimeError(
+            f"[CTRL_FILE:{step_id}] Control file creation failed at '{ctrl_output_path}': {exc}"
+        ) from exc
+
+
+def _raise_moogsoft_incident(pipeline_name: str, step_id: str, invalid_count: int,
+                              error_samples: list | None = None) -> None:
+    """
+    Fire a MoogSoft/ServiceNow incident for validation failure.
+
+    Behaviour:
+      - MOOGSOFT_DRY_RUN=true  → simulates incident creation and logs success
+                                  (useful for testing without real credentials)
+      - MOOGSOFT_ENDPOINT + MOOGSOFT_API_KEY set → creates a real incident
+      - Neither set            → logs a WARNING and returns without creating anything
+    """
+    endpoint = os.environ.get("MOOGSOFT_ENDPOINT", "")
+    api_key  = os.environ.get("MOOGSOFT_API_KEY", "")
+    dry_run  = os.environ.get("MOOGSOFT_DRY_RUN", "").strip().lower() in ("1", "true", "yes")
+
+    # ── Dry-run / test mode ──────────────────────────────────────────────────
+    if dry_run:
+        import uuid
+        simulated_key = f"DRY-RUN-{uuid.uuid4().hex[:8].upper()}"
+        LOG.info(
+            "[INCIDENT] ServiceNow incident created (dry-run mode) — "
+            "pipeline='%s' step='%s' invalid_rows=%d alert_key=%s  "
+            "Errors: %s",
+            pipeline_name, step_id, invalid_count, simulated_key,
+            "; ".join(error_samples or []),
+        )
+        return
+
+    # ── No credentials configured ────────────────────────────────────────────
+    if not endpoint or not api_key:
+        LOG.warning(
+            "[INCIDENT] Validation failed (%d invalid row(s)) in pipeline '%s' step '%s', "
+            "but MOOGSOFT_ENDPOINT / MOOGSOFT_API_KEY are not set — "
+            "ServiceNow incident was NOT created.  "
+            "Set these environment variables to enable automated incident creation.  "
+            "To test incident logging without real credentials set MOOGSOFT_DRY_RUN=true.",
+            invalid_count, pipeline_name, step_id,
+        )
+        return
+
+    # ── Real incident creation ───────────────────────────────────────────────
+    try:
+        from .incident import MoogsoftIncidentConnector
+        connector = MoogsoftIncidentConnector(endpoint=endpoint, api_key=api_key)
+        alert_key = connector.create_validation_incident(
+            pipeline_name=pipeline_name,
+            step_id=step_id,
+            invalid_count=invalid_count,
+            error_samples=error_samples or [],
+        )
+        LOG.info(
+            "[INCIDENT] ServiceNow incident created — "
+            "pipeline='%s' step='%s' invalid_rows=%d alert_key=%s",
+            pipeline_name, step_id, invalid_count, alert_key,
+        )
+    except Exception as exc:
+        LOG.warning("[INCIDENT] Failed to create MoogSoft incident: %s", exc)
 
 
 def _col(name: str) -> str:
@@ -165,9 +712,20 @@ class MainframeTransformationExecutor:
             else:
                 result = source_df
         elif step_type == "validate":
+            # Inject step context so the validator can reference them in incidents
+            logic.setdefault("_step_id", step.get("id") or alias)
+            logic.setdefault("_pipeline_name", step.get("pipeline_name", "unknown"))
             result = self._apply_validate(source_df, logic)
         elif step_type == "select":
             result = self._apply_select(source_df, logic)
+        elif step_type == "oracle_write":
+            # Oracle Write is a terminal sink — loads data into Oracle via SQL*Loader.
+            # The source DataFrame is passed through unchanged so downstream steps
+            # (if any) can still reference the same alias.
+            pipeline_name = step.get("pipeline_name", "unknown")
+            step_id       = step.get("id") or alias
+            self._apply_oracle_write(source_df, logic, pipeline_name, step_id)
+            result = source_df   # pass-through so alias remains resolvable
         else:
             result = source_df
 
@@ -429,6 +987,53 @@ class MainframeTransformationExecutor:
         return result
 
     # ------------------------------------------------------------------
+    def _apply_oracle_write(
+        self,
+        df: DataFrame,
+        logic: dict,
+        pipeline_name: str = "unknown",
+        step_id: str = "",
+    ) -> None:
+        """Load the source DataFrame into Oracle Database via SQL*Loader.
+
+        Credentials are fetched from HashiCorp Vault at runtime — they are
+        *never* stored in the dataflow config JSON.
+
+        Steps
+        -----
+        1. Validate required config fields (host, service_name, table, vault_path).
+        2. Retrieve Oracle username / password from HashiCorp Vault.
+        3. Coalesce DataFrame → single CSV partition in a local temp directory.
+        4. Generate a SQL*Loader .ctl control file from the DataFrame schema.
+        5. Execute ``sqlldr`` as a subprocess.
+        6. Clean up temp files.
+
+        Args:
+            df            : Source DataFrame (output of the previous step).
+            logic         : ``oracle_write`` step logic dict (from config JSON).
+            pipeline_name : Pipeline name for log / error messages.
+            step_id       : Step ID for log / error messages.
+
+        Raises:
+            RuntimeError  : if config is incomplete, Vault is unreachable,
+                            or SQL*Loader returns a fatal exit code.
+        """
+        LOG.info("[oracle_write:%s] Starting Oracle write for pipeline '%s'", step_id, pipeline_name)
+        try:
+            write_df_to_oracle(
+                df=df,
+                logic=logic,
+                pipeline_name=pipeline_name,
+                step_id=step_id,
+            )
+        except RuntimeError:
+            raise   # already has context — re-raise as-is
+        except Exception as exc:
+            raise RuntimeError(
+                f"[oracle_write:{step_id}] Unexpected error during Oracle write: {exc}"
+            ) from exc
+
+    # ------------------------------------------------------------------
     def _apply_validate(self, df: DataFrame, logic: dict) -> DataFrame:
         """
         Data validation transformation.
@@ -446,15 +1051,119 @@ class MainframeTransformationExecutor:
                           regex        user-supplied pattern
 
         fail_mode controls what happens when a row fails:
-          flag  (default) – adds ``_validation_errors`` (semicolon-joined messages)
+          FLAG  (default) – adds ``_validation_errors`` (semicolon-joined messages)
                             and ``_is_valid`` (boolean) to every row
-          drop            – returns only rows where all rules pass; invalid rows
-                            are silently discarded (count logged)
-          abort           – raises RuntimeError listing the first bad rows
+          DROP            – returns only rows where all rules pass; invalid rows
+                            are written to error_path and count is logged
+          ABORT           – raises RuntimeError listing the first bad rows
+
+        Optional path fields (from logic dict):
+          error_path        – path to write invalid rows (s3:// or local)
+          validated_path    – path to write valid rows (s3:// or local)
+          ctrl_file_create  – True to generate a control file after validation
+          ctrl_file_name    – filename for the control file (e.g. USB.HOGON.TRAN.CTL);
+                              the file is written to validated_path automatically
+          ctrl_output_path  – (legacy) explicit path override; if absent the control
+                              file is co-located with validated_path
+          ctrl_file_fields  – list of {name, type, expression} dicts driving the
+                              control file content (PySpark agg expressions)
+
+        On validation failure (invalid_count > 0), a MoogSoft/ServiceNow incident
+        is raised automatically if MOOGSOFT_ENDPOINT / MOOGSOFT_API_KEY are configured.
         """
-        rules        = logic.get("rules") or []
-        fail_mode    = (logic.get("fail_mode") or "flag").lower()
-        error_bucket = (logic.get("error_bucket") or "").strip()
+        rules             = logic.get("rules") or []
+        fail_mode         = (logic.get("fail_mode") or "FLAG").upper()
+        # Support both new names (validated_path / error_path) and legacy names
+        error_path          = (logic.get("error_path") or logic.get("error_bucket") or "").strip()
+        validated_path      = (logic.get("validated_path") or logic.get("validation_bucket") or "").strip()
+        # Single named-file output: when set the data is written as one named
+        # file (no part-files, no _SUCCESS) instead of a Parquet directory.
+        validated_file_name = (logic.get("validated_file_name") or "").strip()
+        error_file_name     = (logic.get("error_file_name")     or "").strip()
+        # Source input field definitions injected by the runner so validated /
+        # error files are written as true fixed-width (same layout as the input).
+        _source_fields  = logic.get("_source_fields") or []
+        _record_length  = int(logic.get("_record_length") or 0)
+        pipeline_name   = logic.get("_pipeline_name", "unknown")
+        step_id           = logic.get("_step_id", "validate")
+
+        # ── Path partition (frequency / date sub-directory) ─────────────────
+        # Apply the same <path>/<FREQUENCY>/<date> convention used for inputs/outputs.
+        _frequency     = (logic.get("frequency")          or "").strip()
+        _partition_col = (logic.get("path_partition_col") or "").strip()
+        if _frequency:
+            from .config_loader import _build_partitioned_path as _bpp
+            if validated_path:
+                validated_path = _bpp(validated_path, "", _frequency, _partition_col)
+            if error_path:
+                error_path = _bpp(error_path, "", _frequency, _partition_col)
+
+        # ── Control File Creation ────────────────────────────────────────────
+        ctrl_file_create  = bool(logic.get("ctrl_file_create", False))
+        ctrl_file_name    = (logic.get("ctrl_file_name")   or "").strip()
+        ctrl_file_fields  = logic.get("ctrl_file_fields") or []
+        # The control file is co-located with the validated output data.
+        # For backward-compat we still honour an explicit ctrl_output_path when
+        # present in older configs; otherwise fall back to validated_path.
+        _explicit_ctrl_path = (logic.get("ctrl_output_path") or "").strip()
+        ctrl_output_path    = _explicit_ctrl_path or validated_path
+        # Apply frequency/date partition to ctrl_output_path when it differs
+        # from validated_path (validated_path already has partition applied above)
+        if _explicit_ctrl_path and _frequency:
+            from .config_loader import _build_partitioned_path as _bpp
+            ctrl_output_path = _bpp(_explicit_ctrl_path, "", _frequency, _partition_col)
+
+        # ── Last Run File Check ──────────────────────────────────────────────
+        last_run_check     = bool(logic.get("last_run_check", False))
+        last_run_file_path = (logic.get("last_run_file_path") or "").strip()
+        last_run_file_name = (logic.get("last_run_file_name") or "").strip()
+        last_run_frequency = (logic.get("last_run_frequency") or "").strip().upper()
+        partition_column   = (logic.get("partition_column") or "").strip()
+
+        if last_run_check:
+            if not last_run_file_path or not last_run_file_name:
+                raise RuntimeError(
+                    f"[VALIDATE] last_run_check is enabled in step '{step_id}' but "
+                    f"'last_run_file_path' or 'last_run_file_name' is not configured."
+                )
+            # Apply frequency / date-partition to the base path (same convention as
+            # input and output files: <base>/<FREQUENCY>/<date>/<file>).
+            if last_run_frequency and partition_column:
+                from .config_loader import _build_partitioned_path as _bpp
+                last_run_file_path = _bpp(last_run_file_path, "", last_run_frequency, partition_column)
+                LOG.info(
+                    "[VALIDATE] Last run file partitioned path: %s  (frequency=%s, partition=%s)",
+                    last_run_file_path, last_run_frequency, partition_column,
+                )
+            # Build the full path to the last run date file
+            if _is_s3_path(last_run_file_path):
+                full_last_run_path = last_run_file_path.rstrip("/") + "/" + last_run_file_name
+            else:
+                full_last_run_path = str(
+                    Path(last_run_file_path.replace("file://", "")) / last_run_file_name
+                )
+
+            LOG.info("[VALIDATE] Checking for last run date file: %s", full_last_run_path)
+
+            if not _check_file_exists(full_last_run_path):
+                LOG.error(
+                    "[VALIDATE] Last run date file not found at '%s'. "
+                    "Creating ServiceNow incident and aborting job.",
+                    full_last_run_path,
+                )
+                _raise_last_run_file_missing_incident(
+                    pipeline_name=pipeline_name,
+                    step_id=step_id,
+                    file_path=full_last_run_path,
+                    partition_column=partition_column,
+                )
+                raise RuntimeError(
+                    f"[VALIDATE] Job aborted: last run date file not found at "
+                    f"'{full_last_run_path}'. Pipeline: '{pipeline_name}', "
+                    f"Step: '{step_id}'. A ServiceNow incident has been raised."
+                )
+
+            LOG.info("[VALIDATE] Last run date file found: %s", full_last_run_path)
 
         # ── format → regex pattern map ──────────────────────────────────
         # Both lowercase (legacy) and uppercase (new UI) forms are supported.
@@ -520,9 +1229,17 @@ class MainframeTransformationExecutor:
             # 2. DATA TYPE check ─────────────────────────────────────────
             if data_type in TYPE_CAST:
                 cast_type = TYPE_CAST[data_type]
+                # Guard: empty / whitespace-only strings must NOT trigger a type
+                # error — they represent a null / missing value and are handled
+                # by the nullable check above.  This matters most for fixed-width
+                # inputs where all columns arrive as trimmed strings: an all-space
+                # numeric field trims to "" which would fail the numeric cast and
+                # produce a spurious "not a valid number" error if not guarded.
                 error_exprs.append(
                     F.when(
-                        col_ref.isNotNull() & col_ref.cast(cast_type).isNull(),
+                        col_ref.isNotNull() &
+                        (F.trim(col_ref.cast("string")) != "") &
+                        col_ref.cast(cast_type).isNull(),
                         F.lit(f"'{field}' is not a valid {data_type}")
                     ).otherwise(F.lit(None).cast("string"))
                 )
@@ -598,48 +1315,146 @@ class MainframeTransformationExecutor:
         errors_col   = F.concat_ws("; ", *error_exprs)
         is_valid_col = (F.length(errors_col) == 0)
 
-        if fail_mode == "drop":
+        if fail_mode == "DROP":
             valid_df      = df.filter(is_valid_col)
             invalid_df    = df.filter(~is_valid_col)
             invalid_count = invalid_df.count()
-            LOG.info("[VALIDATE] drop mode: %d invalid row(s) removed.", invalid_count)
-            if error_bucket and invalid_count > 0:
-                # Annotate invalid rows with error details before writing to the error bucket
+            LOG.info("[VALIDATE] DROP mode: %d invalid row(s) removed.", invalid_count)
+            if error_path and invalid_count > 0:
+                # Annotate invalid rows with error details before writing to the error path
                 invalid_annotated = (invalid_df
                                      .withColumn("_validation_errors",
                                                  F.concat_ws("; ", *error_exprs))
                                      .withColumn("_is_valid", F.lit(False)))
-                (invalid_annotated
-                 .write
-                 .mode("append")
-                 .parquet(error_bucket))
+                if _source_fields and error_file_name:
+                    _write_fixed_width_to_path(
+                        invalid_annotated, _source_fields, error_path, error_file_name, _record_length)
+                else:
+                    _write_df_to_path(invalid_annotated, error_path, mode="append", file_name=error_file_name)
                 LOG.info(
-                    "[VALIDATE] Wrote %d invalid row(s) to error bucket: %s",
-                    invalid_count, error_bucket
+                    "[VALIDATE] Wrote %d invalid row(s) to error path: %s",
+                    invalid_count, error_path
                 )
+            if invalid_count > 0:
+                # Collect sample error messages for incident
+                sample_rows = (invalid_df
+                               .withColumn("_validation_errors", F.concat_ws("; ", *error_exprs))
+                               .select("_validation_errors").limit(5).collect())
+                error_samples = [r["_validation_errors"] for r in sample_rows]
+                _raise_moogsoft_incident(pipeline_name, step_id, invalid_count, error_samples)
+                # Abort the job — any validation failure must stop the pipeline.
+                raise RuntimeError(
+                    f"[VALIDATE] Job aborted: {invalid_count} invalid row(s) detected "
+                    f"in pipeline '{pipeline_name}', step '{step_id}'. "
+                    f"All invalid records written to error path. "
+                    f"A ServiceNow incident has been raised. "
+                    f"First errors: {error_samples}"
+                )
+            if validated_path:
+                valid_count = valid_df.count()
+                if _source_fields and validated_file_name:
+                    _write_fixed_width_to_path(
+                        valid_df, _source_fields, validated_path, validated_file_name, _record_length)
+                else:
+                    _write_df_to_path(valid_df, validated_path, mode="append", file_name=validated_file_name)
+                LOG.info(
+                    "[VALIDATE] Wrote %d valid row(s) to validated path: %s",
+                    valid_count, validated_path
+                )
+            if ctrl_file_create and ctrl_output_path:
+                _create_ctrl_file(valid_df, ctrl_file_fields, ctrl_output_path, step_id, ctrl_file_name)
             return valid_df
 
-        # Build annotated DataFrame for flag / abort
+        # Build annotated DataFrame for FLAG / ABORT
         annotated = (df
                      .withColumn("_validation_errors", errors_col)
                      .withColumn("_is_valid", is_valid_col))
 
-        if fail_mode == "abort":
+        if fail_mode == "ABORT":
             invalid_count = annotated.filter(~F.col("_is_valid")).count()
             if invalid_count > 0:
+                # Write invalid records to error_path before aborting
+                if error_path:
+                    invalid_annotated = (annotated
+                                         .filter(~F.col("_is_valid"))
+                                         .withColumn("_is_valid", F.lit(False)))
+                    if _source_fields and error_file_name:
+                        _write_fixed_width_to_path(
+                            invalid_annotated, _source_fields, error_path, error_file_name, _record_length)
+                    else:
+                        _write_df_to_path(invalid_annotated, error_path, mode="append", file_name=error_file_name)
+                    LOG.info(
+                        "[VALIDATE] ABORT: wrote %d invalid row(s) to error path: %s",
+                        invalid_count, error_path,
+                    )
                 samples = (annotated
                            .filter(~F.col("_is_valid"))
                            .select("_validation_errors")
                            .limit(5)
                            .collect())
                 msgs = [r["_validation_errors"] for r in samples]
+                _raise_moogsoft_incident(pipeline_name, step_id, invalid_count, msgs)
                 raise RuntimeError(
                     f"[VALIDATE] Data validation failed: {invalid_count} invalid row(s). "
                     f"First errors: {msgs}"
                 )
-            # All rows valid — return without extra columns
+            # ABORT mode — all rows valid.
+            # Write valid records to validated layer so downstream consumers
+            # can read from the validated path if needed.
+            if validated_path:
+                valid_count = df.count()
+                if _source_fields and validated_file_name:
+                    _write_fixed_width_to_path(
+                        df, _source_fields, validated_path, validated_file_name, _record_length)
+                else:
+                    _write_df_to_path(df, validated_path, mode="append", file_name=validated_file_name)
+                LOG.info(
+                    "[VALIDATE] ABORT: wrote %d valid row(s) to validated path: %s",
+                    valid_count, validated_path,
+                )
+            if ctrl_file_create and ctrl_output_path:
+                _create_ctrl_file(df, ctrl_file_fields, ctrl_output_path, step_id, ctrl_file_name)
             return df
 
-        # Default: flag — return annotated DataFrame
-        LOG.info("[VALIDATE] flag mode: validation columns _is_valid, _validation_errors added.")
+        # Default: FLAG — annotate rows, but abort if any are invalid.
+        LOG.info("[VALIDATE] FLAG mode: validation columns _is_valid, _validation_errors added.")
+        invalid_count = annotated.filter(~F.col("_is_valid")).count()
+        if invalid_count > 0:
+            # Write ALL invalid rows to error_path with full error annotations.
+            if error_path:
+                invalid_annotated = annotated.filter(~F.col("_is_valid"))
+                if _source_fields and error_file_name:
+                    _write_fixed_width_to_path(
+                        invalid_annotated, _source_fields, error_path, error_file_name, _record_length)
+                else:
+                    _write_df_to_path(invalid_annotated, error_path, mode="append", file_name=error_file_name)
+                LOG.info("[VALIDATE] Wrote %d invalid row(s) to error path: %s", invalid_count, error_path)
+            sample_rows = (annotated
+                           .filter(~F.col("_is_valid"))
+                           .select("_validation_errors").limit(5).collect())
+            error_samples = [r["_validation_errors"] for r in sample_rows]
+            _raise_moogsoft_incident(pipeline_name, step_id, invalid_count, error_samples)
+            # Abort the job — any validation failure must stop the pipeline.
+            raise RuntimeError(
+                f"[VALIDATE] Job aborted: {invalid_count} invalid row(s) detected "
+                f"in pipeline '{pipeline_name}', step '{step_id}'. "
+                f"All invalid records written to error path. "
+                f"A ServiceNow incident has been raised. "
+                f"First errors: {error_samples}"
+            )
+        # All rows valid — write to validated path and create ctrl file.
+        if validated_path:
+            valid_df    = annotated.filter(F.col("_is_valid"))
+            valid_count = valid_df.count()
+            if _source_fields and validated_file_name:
+                _write_fixed_width_to_path(
+                    valid_df, _source_fields, validated_path, validated_file_name, _record_length)
+            else:
+                _write_df_to_path(valid_df, validated_path, mode="append", file_name=validated_file_name)
+            LOG.info(
+                "[VALIDATE] Wrote %d valid row(s) to validated path: %s",
+                valid_count, validated_path
+            )
+        if ctrl_file_create and ctrl_output_path:
+            _create_ctrl_file(df, ctrl_file_fields, ctrl_output_path, step_id, ctrl_file_name)
         return annotated

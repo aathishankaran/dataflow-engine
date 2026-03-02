@@ -1,35 +1,117 @@
 #!/usr/bin/env python3
 """
 Run mainframe dataflow from generated config JSON.
+Python 3.12+ compatible.  Runs on Linux, macOS, and Windows.
 
 Usage:
     python run_dataflow.py samples/config.json
-    python run_dataflow.py samples/config.json --base-path .
+    python run_dataflow.py samples/config.json --base-path /data/pipelines
+    python run_dataflow.py samples/config.json --master spark://host:7077
     python run_dataflow.py samples/config.json --dry-run
 
-Windows: Set JAVA_HOME to your JDK and (recommended) HADOOP_HOME to a folder
-containing bin/winutils.exe to avoid ExitCodeException -1073741515. See WINDOWS.md.
+The runner auto-detects the host OS (Linux / macOS / Windows) and applies
+the appropriate PySpark / Hadoop / Java configuration at startup.
+
+Environment variables (optional):
+    JAVA_HOME           – path to JDK (required for Spark)
+    HADOOP_HOME         – path to Hadoop / winutils.exe directory (Windows only)
+    SPARK_LOCAL_DIRS    – override Spark local scratch directory
+    AWS_ACCESS_KEY_ID   – explicit AWS key (use IAM roles instead in production)
+    AWS_SECRET_ACCESS_KEY
+    AWS_REGION          – default us-east-1
 """
 
 import argparse
 import logging
 import os
+import platform
 import sys
 from pathlib import Path
 
-from pyspark.sql import SparkSession
+# ── import runner FIRST so _configure_spark_for_os() runs before SparkSession
+from dataflow_engine.runner import DataFlowRunner, _IS_WINDOWS, _IS_MACOS, _IS_LINUX
 
-from dataflow_engine.runner import DataFlowRunner
+from pyspark.sql import SparkSession
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+LOG = logging.getLogger(__name__)
+
+
+def _build_spark_session(master: str) -> SparkSession:
+    """
+    Create a SparkSession with settings appropriate for the host OS and
+    the current Python 3.12 runtime.
+    """
+    LOG.info("Building SparkSession: OS=%s, master=%s, Python=%s",
+             platform.system(), master, sys.version.split()[0])
+
+    builder = (
+        SparkSession.builder
+        .appName("dataflow_engine")
+        .master(master)
+        .config("spark.sql.legacy.timeParserPolicy", "LEGACY")
+        # Ensure PySpark workers use the same Python interpreter
+        .config("spark.pyspark.python",        sys.executable)
+        .config("spark.pyspark.driver.python", sys.executable)
+    )
+
+    if _IS_WINDOWS:
+        # ── Windows-specific settings ──────────────────────────────────────
+        hadoop_home = os.environ.get("HADOOP_HOME", "").strip()
+        if hadoop_home:
+            # Normalise path (fix "C:hadoop" → "C:\hadoop")
+            hpath = Path(hadoop_home)
+            if not hpath.is_absolute():
+                if len(hadoop_home) >= 2 and hadoop_home[1] == ":" and \
+                   (len(hadoop_home) == 2 or hadoop_home[2] != "\\"):
+                    hadoop_home = hadoop_home[:2] + "\\" + hadoop_home[2:]
+                    hpath = Path(hadoop_home)
+                else:
+                    hpath = hpath.resolve()
+                hadoop_home = str(hpath)
+            # Pass HADOOP_HOME to the JVM via driver Java options
+            hadoop_home_jvm = hadoop_home.replace("\\", "\\\\")
+            builder = builder.config(
+                "spark.driver.extraJavaOptions",
+                f"-Dhadoop.home.dir={hadoop_home_jvm}"
+            )
+            LOG.info("Windows: HADOOP_HOME=%s", hadoop_home)
+        else:
+            LOG.warning(
+                "Windows: HADOOP_HOME not set.  If you encounter ExitCodeException "
+                "-1073741515, set HADOOP_HOME to a folder containing bin/winutils.exe."
+            )
+
+        # Use a Windows-friendly local scratch directory
+        local_dir = (os.environ.get("SPARK_LOCAL_DIRS") or
+                     os.environ.get("TEMP") or
+                     os.environ.get("TMP") or
+                     "C:\\Temp")
+        scratch = str(Path(local_dir) / "spark_tmp")
+        Path(scratch).mkdir(parents=True, exist_ok=True)
+        builder = builder.config("spark.local.dir", scratch)
+        LOG.debug("Windows: spark.local.dir=%s", scratch)
+
+    elif _IS_MACOS:
+        # ── macOS-specific settings ────────────────────────────────────────
+        # On Apple Silicon (arm64) some Spark native libs may not be present;
+        # falling back to Java implementation avoids native-lib errors.
+        builder = builder.config("spark.io.compression.codec", "snappy")
+        LOG.debug("macOS: applied macOS-specific Spark configuration")
+
+    else:
+        # ── Linux (default production environment) ─────────────────────────
+        LOG.debug("Linux: using default Spark configuration")
+
+    return builder.getOrCreate()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run mainframe dataflow from config JSON",
+        description="Run mainframe dataflow from config JSON (Python 3.12 / cross-platform)",
     )
     parser.add_argument(
         "config",
@@ -42,18 +124,18 @@ def main() -> None:
         "--base-path",
         type=Path,
         default=None,
-        help="Base path for relative file paths (default: project root)",
+        help="Base path for relative file paths (default: parent of config file)",
     )
     parser.add_argument(
         "--no-cobrix",
         action="store_true",
-        help="Disable Cobrix; use parquet/csv for inputs",
+        help="Disable Cobrix COBOL reader; use Parquet/CSV for inputs",
     )
     parser.add_argument(
         "--master",
         type=str,
         default="local[*]",
-        help="Spark master URL",
+        help="Spark master URL (default: local[*])",
     )
     parser.add_argument(
         "--dry-run",
@@ -66,44 +148,9 @@ def main() -> None:
     if not config_path.exists():
         raise SystemExit(f"Config file not found: {config_path}")
 
-    # Default base_path: project root (parent of script)
     base_path = args.base_path or Path(__file__).resolve().parent
 
-    builder = (
-        SparkSession.builder
-        .appName("mainframe_migration")
-        .master(args.master)
-        .config("spark.sql.legacy.timeParserPolicy", "LEGACY")
-    )
-
-    # Windows: avoid ExitCodeException -1073741515 (missing winutils / Hadoop native)
-    if sys.platform == "win32":
-        hadoop_home = os.environ.get("HADOOP_HOME", "").strip()
-        if hadoop_home:
-            # Must be an absolute path. Fix "C:hadoop" (invalid) -> "C:\hadoop"
-            hadoop_path = Path(hadoop_home)
-            if not hadoop_path.is_absolute():
-                # Windows: "C:hadoop" means drive C + path; make it "C:\hadoop"
-                if len(hadoop_home) >= 2 and hadoop_home[1] == ":" and (len(hadoop_home) == 2 or hadoop_home[2] != "\\"):
-                    hadoop_home = hadoop_home[0:2] + "\\" + hadoop_home[2:]
-                    hadoop_path = Path(hadoop_home)
-                else:
-                    hadoop_path = hadoop_path.resolve()
-                hadoop_home = str(hadoop_path)
-            # Escape backslashes for JVM so it receives C:\hadoop correctly
-            hadoop_home_java = hadoop_home.replace("\\", "\\\\")
-            builder = builder.config("spark.driver.extraJavaOptions", f"-Dhadoop.home.dir={hadoop_home_java}")
-        else:
-            logging.warning(
-                "Windows detected and HADOOP_HOME is not set. If you see ExitCodeException -1073741515, "
-                "set HADOOP_HOME to a folder containing bin/winutils.exe. See dataflow-engine/WINDOWS.md"
-            )
-        # Use a local temp dir to reduce path/permission issues
-        local_dir = os.environ.get("SPARK_LOCAL_DIR") or os.environ.get("TEMP") or os.environ.get("TMP") or "."
-        if local_dir:
-            builder = builder.config("spark.local.dir", local_dir)
-
-    spark = builder.getOrCreate()
+    spark = _build_spark_session(master=args.master)
 
     runner = DataFlowRunner(
         spark=spark,
@@ -116,13 +163,13 @@ def main() -> None:
     runner.run_transformations()
 
     if args.dry_run:
-        print("Dry run: skipping output writes.")
+        LOG.info("Dry run — skipping output writes.")
         for name, df in runner.output_dfs.items():
             count = df.count()
-            print(f"  {name}: {count} rows")
+            LOG.info("  %s: %d rows", name, count)
     else:
         runner.write_outputs()
-        print("Dataflow completed. Outputs written to samples/output/")
+        LOG.info("Dataflow completed. Outputs written.")
 
 
 if __name__ == "__main__":
