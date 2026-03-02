@@ -262,6 +262,130 @@ class MoogsoftIncidentConnector:
             service="dataflow",
         )
 
+    def create_last_run_file_missing_incident(
+        self,
+        pipeline_name: str,
+        step_id: str,
+        file_path: str,
+        partition_column: str,
+        severity: str = SEVERITY_CRITICAL,
+        tags: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """
+        Convenience wrapper — creates a CRITICAL incident when the last run date
+        file is not found, causing the job to be aborted.
+
+        Parameters
+        ----------
+        pipeline_name : str
+            Name of the dataflow pipeline / configuration.
+        step_id : str
+            The validate step ID that triggered the check.
+        file_path : str
+            Full path (local or S3) where the last run date file was expected.
+        partition_column : str
+            The partition column configured for date-partitioned processing.
+        severity : str, optional
+            Incident severity (default ``CRITICAL``).
+        tags : dict, optional
+            Additional tags merged with pipeline/step metadata.
+
+        Returns
+        -------
+        str
+            The ``alert_key`` used in the submitted event.
+        """
+        summary = (
+            f"Last run date file missing — pipeline '{pipeline_name}' "
+            f"step '{step_id}' aborted"
+        )
+        description = (
+            f"Pipeline         : {pipeline_name}\n"
+            f"Step             : {step_id}\n"
+            f"Expected File    : {file_path}\n"
+            f"Partition Column : {partition_column}\n\n"
+            f"The dataflow job was aborted because the last run date file was not "
+            f"found at the configured path. Please verify that the file exists and "
+            f"is accessible, then re-run the pipeline."
+        )
+        merged_tags: Dict[str, Any] = {
+            "pipeline":         pipeline_name,
+            "step":             step_id,
+            "missing_file":     file_path,
+            "partition_column": partition_column,
+        }
+        if tags:
+            merged_tags.update(tags)
+
+        return self.create_incident(
+            summary=summary,
+            description=description,
+            severity=severity,
+            alert_key=f"dataflow.{pipeline_name}.{step_id}.last_run_file_missing",
+            tags=merged_tags,
+            service="dataflow",
+        )
+
+    def create_input_file_missing_incident(
+        self,
+        pipeline_name: str,
+        input_name: str,
+        file_path: str,
+        severity: str = SEVERITY_CRITICAL,
+        tags: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """
+        Convenience wrapper — creates a CRITICAL incident when a required
+        input file is not found at the expected path, causing the job to abort.
+
+        Parameters
+        ----------
+        pipeline_name : str
+            Name of the dataflow pipeline / configuration.
+        input_name : str
+            The logical input name as defined in the config (e.g. 'HOGAN-INPUT').
+        file_path : str
+            Full path (local or S3) where the input file was expected.
+        severity : str, optional
+            Incident severity (default ``CRITICAL``).
+        tags : dict, optional
+            Additional tags merged with pipeline/input metadata.
+
+        Returns
+        -------
+        str
+            The ``alert_key`` used in the submitted event.
+        """
+        summary = (
+            f"Input file not found — pipeline '{pipeline_name}' "
+            f"input '{input_name}' aborted"
+        )
+        description = (
+            f"Pipeline      : {pipeline_name}\n"
+            f"Input Name    : {input_name}\n"
+            f"Expected Path : {file_path}\n\n"
+            f"The dataflow job was aborted because the required input file was not "
+            f"found at the configured path. The file has not been created or delivered "
+            f"to the expected location. Please verify that the upstream process has "
+            f"completed successfully and the file exists, then re-run the pipeline."
+        )
+        merged_tags: Dict[str, Any] = {
+            "pipeline":    pipeline_name,
+            "input_name":  input_name,
+            "missing_file": file_path,
+        }
+        if tags:
+            merged_tags.update(tags)
+
+        return self.create_incident(
+            summary=summary,
+            description=description,
+            severity=severity,
+            alert_key=f"dataflow.{pipeline_name}.{input_name}.input_file_missing",
+            tags=merged_tags,
+            service="dataflow",
+        )
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
