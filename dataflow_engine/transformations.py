@@ -26,9 +26,112 @@ LOG = logging.getLogger(__name__)
 # Protocol helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _extract_holiday_dates(usa_holidays) -> list:
+    """Extract ISO date strings from old format (list of strings) or new structured
+    format (list of dicts with active/name/date). Only active entries are included."""
+    result = []
+    for h in (usa_holidays or []):
+        if isinstance(h, str):
+            result.append(h)
+        elif isinstance(h, dict) and h.get("active", True):
+            d = h.get("date", "")
+            if d:
+                result.append(d)
+    return result
+
+
+def _get_previous_business_day(holidays=None, reference_date=None) -> "date":
+    """Return the previous calendar day before *reference_date* (defaults to today),
+    skipping only dates listed in the supplied holidays.  Weekends are treated as
+    valid business days — only explicit holidays are skipped.
+
+    Args:
+        holidays: List of ISO date strings OR list of dicts {active, name, date}.
+        reference_date: The date to look back from (defaults to date.today()).
+    """
+    from datetime import date, timedelta
+    holiday_set: set[str] = set(_extract_holiday_dates(holidays))
+    d = (reference_date or date.today()) - timedelta(days=1)
+    while d.isoformat() in holiday_set:  # only skip configured holidays
+        d -= timedelta(days=1)
+    return d
+
+
+def _spark_to_py_strptime(spark_fmt: str) -> str:
+    """Convert a Spark/SQL date format string to a Python strptime format.
+
+    Handles both common cases: lowercase ``yyyyMMdd`` and uppercase ``YYYYMMDD``
+    (the latter is used in COBOL-origin configs).  Longest patterns are replaced
+    first to prevent partial matches.
+    """
+    f = spark_fmt.strip()
+    # Year — 4-digit then 2-digit, both cases
+    f = f.replace("YYYY", "%Y").replace("yyyy", "%Y")
+    f = f.replace("YY",   "%y").replace("yy",   "%y")
+    # Month (must come before day to avoid conflict)
+    f = f.replace("MM", "%m")
+    # Day — uppercase and lowercase
+    f = f.replace("DD", "%d").replace("dd", "%d")
+    # Hour / minute / second (common extras)
+    f = f.replace("HH", "%H").replace("hh", "%I")
+    f = f.replace("mm", "%M")
+    f = f.replace("ss", "%S").replace("SS", "%S")
+    return f
+
+
 def _is_s3_path(path: str) -> bool:
     """Return True if the path refers to an S3 location."""
     return path.startswith("s3://") or path.startswith("s3a://") or path.startswith("s3n://")
+
+
+def _s3_rename_part_to_named(spark, staging_dir: str, final_path: str, output_dir: str) -> None:
+    """Promote the single part-file written to *staging_dir* to *final_path*.
+
+    Uses the Hadoop FileSystem API (via PySpark's JVM bridge) so that the
+    rename is an atomic server-side operation — no data is re-transferred.
+    Works for s3://, s3a://, and s3n:// prefixes.
+
+    Raises RuntimeError if no part file is found in the staging directory.
+    """
+    sc         = spark.sparkContext
+    jvm        = sc._jvm
+    hconf      = sc._jsc.hadoopConfiguration()
+    HPath      = jvm.org.apache.hadoop.fs.Path
+    FileSystem = jvm.org.apache.hadoop.fs.FileSystem
+    FileUtil   = jvm.org.apache.hadoop.fs.FileUtil
+    URI        = jvm.java.net.URI
+
+    staging_hpath = HPath(staging_dir)
+    staging_fs    = FileSystem.get(URI.create(staging_dir), hconf)
+
+    # Locate the single part-file (ignore _SUCCESS, .crc, etc.)
+    part_path = None
+    for status in staging_fs.listStatus(staging_hpath):
+        fname = status.getPath().getName()
+        if (fname.startswith("part-") and
+                not fname.startswith(".") and
+                not fname.endswith(".crc")):
+            part_path = status.getPath()
+            break
+
+    if part_path is None:
+        staging_fs.delete(staging_hpath, True)
+        raise RuntimeError(
+            f"[S3_WRITE] No part file found in S3 staging directory: {staging_dir}"
+        )
+
+    target_hpath  = HPath(final_path)
+    target_dir_hp = HPath(output_dir)
+    target_fs     = FileSystem.get(URI.create(output_dir), hconf)
+
+    target_fs.mkdirs(target_dir_hp)
+    if target_fs.exists(target_hpath):
+        target_fs.delete(target_hpath, False)
+
+    # Server-side copy then delete source (atomic on most S3 configurations)
+    FileUtil.copy(staging_fs, part_path, target_fs, target_hpath, True, hconf)
+    staging_fs.delete(staging_hpath, True)
+    LOG.info("[S3_WRITE] Written '%s' → %s", part_path.getName(), final_path)
 
 
 def _write_df_to_path(df: DataFrame, path: str, mode: str = "append", file_name: str = "") -> None:
@@ -76,17 +179,16 @@ def _write_df_to_path(df: DataFrame, path: str, mode: str = "append", file_name:
         LOG.info("[VALIDATE_WRITE] Written '%s' to '%s'.", file_name, actual_path)
 
     elif file_name and _is_s3_path(actual_path):
-        # ── S3: write to staging prefix (single-file rename not yet wired) ───
+        # ── S3: stage to temp prefix then rename via Hadoop FileSystem API ───
         tmp_s3 = actual_path.rstrip("/") + "/_val_tmp_" + file_name.replace(".", "_")
         (df.coalesce(1)
            .write.mode("overwrite")
            .option("header", "false")
            .option("sep", "|")
            .csv(tmp_s3))
-        LOG.warning(
-            "[VALIDATE_WRITE] S3 single-file rename not yet implemented; "
-            "data written to temporary prefix '%s'.", tmp_s3
-        )
+        final_s3 = actual_path.rstrip("/") + "/" + file_name
+        _s3_rename_part_to_named(df.sparkSession, tmp_s3, final_s3, actual_path)
+        LOG.info("[VALIDATE_WRITE] Written '%s' to S3 path '%s'.", file_name, actual_path)
 
     else:
         # ── Original behaviour: Parquet directory write ───────────────────────
@@ -158,12 +260,12 @@ def _write_fixed_width_to_path(
 
     # ── Write as a single named file using staging + rename ───────────────────
     if _is_s3_path(actual_path):
+        # ── S3: stage to temp prefix then rename via Hadoop FileSystem API ───
         tmp_s3 = actual_path.rstrip("/") + "/_fw_tmp_" + file_name.replace(".", "_")
         df_fixed.coalesce(1).write.mode("overwrite").text(tmp_s3)
-        LOG.warning(
-            "[FIXED_WRITE] S3 single-file rename not yet implemented; "
-            "data written to staging prefix '%s'.", tmp_s3
-        )
+        final_s3 = actual_path.rstrip("/") + "/" + file_name
+        _s3_rename_part_to_named(df_fixed.sparkSession, tmp_s3, final_s3, actual_path)
+        LOG.info("[FIXED_WRITE] Written '%s' to S3 path '%s'.", file_name, actual_path)
     else:
         import platform as _platform
         local_dir = Path(actual_path)
@@ -388,20 +490,159 @@ def _raise_last_run_file_missing_incident(
         LOG.warning("[INCIDENT] Failed to create last-run-file-missing incident: %s", exc)
 
 
+def _raise_prev_day_check_incident(
+    pipeline_name: str,
+    input_name: str,
+    file_path: str,
+    expected_date,
+    actual_date,
+) -> None:
+    """
+    Fire a CRITICAL ServiceNow incident when the previous-day header check fails.
+
+    Either the previous business day's raw input file is missing or its header
+    date does not match the expected business day.
+
+    Silently no-ops when MOOGSOFT_ENDPOINT / MOOGSOFT_API_KEY are not configured.
+    Set MOOGSOFT_DRY_RUN=true to simulate incident creation for testing.
+
+    Parameters
+    ----------
+    pipeline_name : str
+        Name of the dataflow pipeline / configuration.
+    input_name : str
+        Logical input name as defined in the config (e.g. 'HOGAN-INPUT').
+    file_path : str
+        Full path to the previous business day's input file that was checked.
+    expected_date : date or str
+        The date the header should have contained (previous business day).
+    actual_date : date or str
+        The date actually found in the previous day file's header (or the error
+        string when the file was missing).
+    """
+    endpoint = os.environ.get("MOOGSOFT_ENDPOINT", "")
+    api_key  = os.environ.get("MOOGSOFT_API_KEY", "")
+    dry_run  = os.environ.get("MOOGSOFT_DRY_RUN", "").strip().lower() in ("1", "true", "yes")
+
+    expected_str = str(expected_date)
+    actual_str   = str(actual_date)
+
+    # ── Dry-run / test mode ──────────────────────────────────────────────────
+    if dry_run:
+        import uuid
+        simulated_key = f"DRY-RUN-{uuid.uuid4().hex[:8].upper()}"
+        LOG.info(
+            "[INCIDENT] Prev-day check incident created (dry-run) — "
+            "pipeline='%s' input='%s' expected='%s' actual='%s' alert_key=%s",
+            pipeline_name, input_name, expected_str, actual_str, simulated_key,
+        )
+        return
+
+    # ── No credentials configured ────────────────────────────────────────────
+    if not endpoint or not api_key:
+        LOG.warning(
+            "[INCIDENT] Prev-day check failed for pipeline '%s' input '%s', "
+            "but MOOGSOFT_ENDPOINT / MOOGSOFT_API_KEY are not set — "
+            "ServiceNow incident was NOT created.  "
+            "Set these environment variables to enable automated incident creation.  "
+            "To test incident logging without real credentials set MOOGSOFT_DRY_RUN=true.",
+            pipeline_name, input_name,
+        )
+        return
+
+    # ── Real incident creation ───────────────────────────────────────────────
+    try:
+        from .incident import MoogsoftIncidentConnector
+        connector = MoogsoftIncidentConnector(endpoint=endpoint, api_key=api_key)
+        alert_key = connector.create_prev_day_check_incident(
+            pipeline_name=pipeline_name,
+            input_name=input_name,
+            file_path=file_path,
+            expected_date=expected_str,
+            actual_date=actual_str,
+        )
+        LOG.info(
+            "[INCIDENT] Prev-day check incident created — "
+            "pipeline='%s' input='%s' expected='%s' actual='%s' alert_key=%s",
+            pipeline_name, input_name, expected_str, actual_str, alert_key,
+        )
+    except Exception as exc:
+        LOG.warning("[INCIDENT] Failed to create prev-day check incident: %s", exc)
+
+
+def _raise_record_count_check_incident(
+    pipeline_name: str,
+    step_id: str,
+    input_file_path: str,
+    expected_count,
+    actual_count,
+) -> None:
+    """
+    Fire a CRITICAL ServiceNow incident when the trailer record count does not
+    match the actual number of data records loaded from the input file.
+
+    Silently no-ops when MOOGSOFT_ENDPOINT / MOOGSOFT_API_KEY are not configured.
+    Set MOOGSOFT_DRY_RUN=true to simulate incident creation for testing.
+    """
+    endpoint = os.environ.get("MOOGSOFT_ENDPOINT", "")
+    api_key  = os.environ.get("MOOGSOFT_API_KEY", "")
+    dry_run  = os.environ.get("MOOGSOFT_DRY_RUN", "").strip().lower() in ("1", "true", "yes")
+
+    if dry_run:
+        import uuid
+        simulated_key = f"DRY-RUN-{uuid.uuid4().hex[:8].upper()}"
+        LOG.info(
+            "[INCIDENT] Record-count check incident created (dry-run) — "
+            "pipeline='%s' step='%s' expected=%s actual=%s alert_key=%s",
+            pipeline_name, step_id, expected_count, actual_count, simulated_key,
+        )
+        return
+
+    if not endpoint or not api_key:
+        LOG.warning(
+            "[INCIDENT] Record count check failed for pipeline '%s' step '%s' "
+            "(expected=%s, actual=%s), but MOOGSOFT_ENDPOINT / MOOGSOFT_API_KEY are not set — "
+            "ServiceNow incident was NOT created.  "
+            "Set these environment variables to enable automated incident creation.  "
+            "To test incident logging without real credentials set MOOGSOFT_DRY_RUN=true.",
+            pipeline_name, step_id, expected_count, actual_count,
+        )
+        return
+
+    try:
+        from .incident import MoogsoftIncidentConnector
+        connector = MoogsoftIncidentConnector(endpoint=endpoint, api_key=api_key)
+        alert_key = connector.create_record_count_check_incident(
+            pipeline_name=pipeline_name,
+            step_id=step_id,
+            input_file_path=input_file_path,
+            expected_count=str(expected_count),
+            actual_count=str(actual_count),
+        )
+        LOG.info(
+            "[INCIDENT] Record-count check incident created — "
+            "pipeline='%s' step='%s' expected=%s actual=%s alert_key=%s",
+            pipeline_name, step_id, expected_count, actual_count, alert_key,
+        )
+    except Exception as exc:
+        LOG.warning("[INCIDENT] Failed to create record-count-check incident: %s", exc)
+
+
 def _create_ctrl_file(
     df: "DataFrame",
     ctrl_file_fields: list[dict],
     ctrl_output_path: str,
     step_id: str = "validate",
     ctrl_file_name: str = "",
+    include_header: bool = False,
 ) -> None:
     """
     Compute control file field values from PySpark expressions and write
-    the result as a single-row CSV.
+    the result as a single-row fixed-width file.
 
     Each entry in *ctrl_file_fields* is::
 
-        {"name": "RECORD_COUNT", "type": "INTEGER", "expression": "count(*)"}
+        {"name": "RECORD_COUNT", "type": "INTEGER", "expression": "count(*)", "length": 10}
 
     Supported expression forms:
     - Aggregation   : ``count(*)``, ``sum(amount)``, ``max(date_col)``
@@ -411,9 +652,17 @@ def _create_ctrl_file(
     The function evaluates every expression via PySpark's ``F.expr()`` inside a
     single ``.agg()`` call so only one Spark action is triggered.
 
+    Fields are formatted fixed-width:
+    - Numeric types (LONG, INT, INTEGER, BIGINT): right-justified, zero-padded
+    - String types: left-justified, space-padded
+    - Default lengths when not specified: numeric=15, string=20
+
     When *ctrl_file_name* is provided, a single named file is written to
     ``ctrl_output_path/<ctrl_file_name>``.  Otherwise the result is written
-    as a Spark CSV directory directly into *ctrl_output_path*.
+    as a Spark text directory directly into *ctrl_output_path*.
+
+    *include_header* controls whether the field-name header row is written
+    at the top of the control file.  Defaults to ``False`` (no header).
     """
     if not ctrl_file_fields:
         LOG.debug("[CTRL_FILE:%s] No ctrl_file_fields defined; skipping control file creation.", step_id)
@@ -422,82 +671,196 @@ def _create_ctrl_file(
         LOG.warning("[CTRL_FILE:%s] ctrl_output_path is empty; skipping control file creation.", step_id)
         return
 
-    LOG.info("[CTRL_FILE:%s] Creating control file at '%s' with %d field(s)%s.",
+    LOG.info("[CTRL_FILE:%s] Creating fixed-width control file at '%s' with %d field(s)%s.",
              step_id, ctrl_output_path, len(ctrl_file_fields),
              f" → '{ctrl_file_name}'" if ctrl_file_name else "")
 
+    _DEFAULT_NUM_LEN = 15
+    _DEFAULT_STR_LEN = 20
+
     try:
-        agg_exprs = []
+        # ── 1. Evaluate aggregation expressions ───────────────────────────
+        agg_exprs   = []
+        field_specs = []   # (name, ftype, length, begin, fmt, just_right) per valid field
         for field_def in ctrl_file_fields:
             name       = (field_def.get("name") or "").strip()
             expression = (field_def.get("expression") or "").strip()
-            if not name or not expression:
-                LOG.debug("[CTRL_FILE:%s] Skipping field with missing name or expression: %s", step_id, field_def)
+            if not name:
+                LOG.debug("[CTRL_FILE:%s] Skipping field with missing name: %s", step_id, field_def)
                 continue
+            ftype  = (field_def.get("type") or "STRING").upper()
+            length = int(field_def.get("length") or 0)
+            if not length:
+                length = _DEFAULT_NUM_LEN if ftype in ("LONG", "INT", "INTEGER", "BIGINT") else _DEFAULT_STR_LEN
+            if not expression:
+                if ftype in ("LONG", "INT", "INTEGER", "BIGINT"):
+                    expression = "count(*)"
+                else:
+                    expression = "cast(null as string)"
+                LOG.debug(
+                    "[CTRL_FILE:%s] Field '%s' has no expression; defaulting to '%s'.",
+                    step_id, name, expression,
+                )
+            begin      = int(field_def.get("begin") or 0)
+            fmt        = (field_def.get("format") or "").strip()
+            just_right = bool(field_def.get("just_right", False))
             agg_exprs.append(F.expr(expression).alias(name))
+            field_specs.append((name, ftype, length, begin, fmt, just_right))
 
         if not agg_exprs:
-            LOG.warning("[CTRL_FILE:%s] No valid field expressions found; skipping control file.", step_id)
+            LOG.warning("[CTRL_FILE:%s] No valid fields found; skipping control file.", step_id)
             return
 
         ctrl_df = df.agg(*agg_exprs)
 
-        # Resolve actual path (strip file:// prefix for local paths)
+        # ── 2. Collect single-row result and format in Python ─────────────
+        ctrl_row = ctrl_df.collect()[0]
+
+        def _fmt_ctrl_field(value, ftype: str, length: int, fmt: str, just_right: bool = False) -> str:
+            """Format a single ctrl-file field value as a fixed-width string.
+
+            For STRING fields, COBOL JUSTIFIED RIGHT (just_right=True) right-aligns
+            the value within the field width (space-pad on the left), mirroring the
+            COBOL JUSTIFIED RIGHT clause behaviour.  All other STRING fields are
+            left-aligned.  Numeric types are always zero-padded right-justified.
+            """
+            if value is None:
+                raw = ""
+            else:
+                raw = str(value)
+            if ftype in ("LONG", "INT", "INTEGER", "BIGINT"):
+                # Numeric: zero-pad right-justified
+                digits = raw.split(".")[0] if "." in raw else raw
+                return digits.zfill(length)[:length]
+            if ftype in ("DOUBLE", "FLOAT", "DECIMAL"):
+                return raw.rjust(length)[:length]
+            if ftype in ("DATE", "TIMESTAMP"):
+                default_spark_fmt = "yyyyMMdd" if ftype == "DATE" else "yyyyMMddHHmmss"
+                py_fmt = _spark_to_py_strptime(fmt or default_spark_fmt)
+                if hasattr(value, "strftime"):
+                    raw = value.strftime(py_fmt)
+                return raw[:length].ljust(length)
+            # STRING — apply format as date format when value supports strftime
+            if fmt and hasattr(value, "strftime"):
+                py_fmt = _spark_to_py_strptime(fmt)
+                raw = value.strftime(py_fmt)
+            # JUSTIFIED RIGHT: right-align with space padding on the left
+            if just_right:
+                return raw[:length].rjust(length)
+            return raw[:length].ljust(length)
+
+        formatted_values = [
+            _fmt_ctrl_field(ctrl_row[name], ftype, length, fmt, just_right)
+            for name, ftype, length, begin, fmt, just_right in field_specs
+        ]
+
+        # ── 3. Build output line — absolute (begin > 0) or sequential ─────
+        has_begin = any(b > 0 for _, _, _, b, _, _jr in field_specs)
+        if has_begin:
+            total_len = max(b + l - 1 for _, _, l, b, _, _jr in field_specs if b > 0)
+            line_chars = [" "] * total_len
+            cur_pos = 0
+            for (name, ftype, length, begin, fmt, just_right), fval in zip(field_specs, formatted_values):
+                pos = (begin - 1) if begin > 0 else cur_pos
+                line_chars[pos:pos + length] = list(fval)
+                if begin == 0:
+                    cur_pos += length
+            output_line = "".join(line_chars)
+        else:
+            output_line = "".join(formatted_values)
+
+        # Wrap into a one-row Spark DataFrame so the existing write
+        # infrastructure (S3 rename, local temp dir, etc.) is unchanged.
+        fixed_df = ctrl_df.sparkSession.range(1).select(F.lit(output_line).alias("value"))
+
+        # ── 3. Prepend header row if requested ────────────────────────────
+        if include_header:
+            if has_begin:
+                hdr_chars = [" "] * total_len
+                cur_pos_h = 0
+                for name, _ftype, length, begin, _fmt, _jr in field_specs:
+                    pos = (begin - 1) if begin > 0 else cur_pos_h
+                    hdr_chars[pos:pos + length] = list((name[:length]).ljust(length))
+                    if begin == 0:
+                        cur_pos_h += length
+                header_line = "".join(hdr_chars)
+            else:
+                header_line = "".join(
+                    (name[:length]).ljust(length)
+                    for name, _ftype, length, _begin, _fmt, _jr in field_specs
+                )
+            # Use range(1)+lit to avoid Python 3.12+ cloudpickle recursion.
+            # Attach an explicit sort key so header is guaranteed to come first
+            # regardless of Spark partition ordering (plain .union() is unordered).
+            # NOTE: select("__row_ord__", "value") ensures column order matches
+            # header_df so .union() (which is positional) aligns correctly.
+            header_df = df.sparkSession.range(1).select(
+                F.lit(0).alias("__row_ord__"),
+                F.lit(header_line).alias("value"),
+            )
+            fixed_df = (
+                header_df
+                .union(
+                    fixed_df
+                    .withColumn("__row_ord__", F.lit(1))
+                    .select("__row_ord__", "value")
+                )
+                .orderBy("__row_ord__")
+                .drop("__row_ord__")
+            )
+
+        # ── 4. Resolve output path ────────────────────────────────────────
         actual_path = ctrl_output_path
         if actual_path.startswith("file://"):
             actual_path = actual_path[7:]
 
         import platform as _platform
-        os_name = _platform.system().lower()   # 'linux', 'darwin', 'windows'
+        os_name = _platform.system().lower()
 
         if ctrl_file_name:
             # ── Write a single named file ──────────────────────────────────
             if _is_s3_path(actual_path):
-                # S3: coalesce to 1, write to a temp prefix, then copy to the
-                # final key.  Requires Hadoop FS or boto3 — log a warning for now.
+                # ── S3: stage to temp prefix then rename via Hadoop FileSystem API ─
                 tmp_s3 = actual_path.rstrip("/") + "/_ctrl_tmp_" + step_id
-                ctrl_df.coalesce(1).write.mode("overwrite").option("header", "true").csv(tmp_s3)
-                LOG.warning(
-                    "[CTRL_FILE:%s] S3 single-file rename not yet implemented; "
-                    "control file is in temporary prefix '%s'.",
-                    step_id, tmp_s3
-                )
+                fixed_df.coalesce(1).write.mode("overwrite").text(tmp_s3)
+                final_s3 = actual_path.rstrip("/") + "/" + ctrl_file_name
+                _s3_rename_part_to_named(fixed_df.sparkSession, tmp_s3, final_s3, actual_path)
+                LOG.info("[CTRL_FILE:%s] Control file written to S3 path '%s'.", step_id, final_s3)
             else:
-                # Local FS: write to a temp sub-directory, then rename the
-                # Spark part-file to the desired filename.
                 local_dir = Path(actual_path)
                 local_dir.mkdir(parents=True, exist_ok=True)
                 tmp_dir = local_dir / ("_ctrl_tmp_" + step_id)
-                # Remove any leftover temp dir from a previous run
                 if tmp_dir.exists():
                     shutil.rmtree(str(tmp_dir))
                 tmp_path_str = str(tmp_dir)
                 if os_name == "windows":
                     tmp_path_str = tmp_path_str.replace("\\", "/")
-                ctrl_df.coalesce(1).write.mode("overwrite").option("header", "true").csv(tmp_path_str)
-                # Locate the CSV part file produced by Spark
-                part_files = sorted(tmp_dir.glob("part-*.csv"))
+                fixed_df.coalesce(1).write.mode("overwrite").text(tmp_path_str)
+                # Locate the text part file (exclude .crc / _SUCCESS)
+                part_files = sorted(
+                    p for p in tmp_dir.glob("part-*")
+                    if p.suffix not in (".crc",) and p.is_file()
+                )
                 if not part_files:
                     raise RuntimeError(
-                        f"[CTRL_FILE:{step_id}] No CSV part file found in temp dir '{tmp_dir}'"
+                        f"[CTRL_FILE:{step_id}] No part file found in temp dir '{tmp_dir}'"
                     )
                 dest_file = local_dir / ctrl_file_name
                 shutil.move(str(part_files[0]), str(dest_file))
-                # Clean up the temp directory (SUCCESS markers, etc.)
                 shutil.rmtree(str(tmp_dir))
-                LOG.info("[CTRL_FILE:%s] Control file written to '%s'.", step_id, dest_file)
+                LOG.info("[CTRL_FILE:%s] Fixed-width control file written to '%s'.", step_id, dest_file)
         else:
-            # ── Write Spark CSV directory (original behaviour) ─────────────
+            # ── Write Spark text directory ─────────────────────────────────
             if _is_s3_path(actual_path):
-                ctrl_df.coalesce(1).write.mode("overwrite").option("header", "true").csv(actual_path)
+                fixed_df.coalesce(1).write.mode("overwrite").text(actual_path)
             else:
                 local_dir = Path(actual_path)
                 local_dir.mkdir(parents=True, exist_ok=True)
-                ctrl_df.coalesce(1).write.mode("overwrite").option("header", "true").csv(
+                fixed_df.coalesce(1).write.mode("overwrite").text(
                     actual_path if os_name != "windows"
                     else actual_path.replace("\\", "/")
                 )
-            LOG.info("[CTRL_FILE:%s] Control file written to '%s'.", step_id, ctrl_output_path)
+            LOG.info("[CTRL_FILE:%s] Fixed-width control file written to '%s'.", step_id, ctrl_output_path)
 
     except Exception as exc:
         LOG.error("[CTRL_FILE:%s] Failed to create control file: %s", step_id, exc)
@@ -715,6 +1078,7 @@ class MainframeTransformationExecutor:
             # Inject step context so the validator can reference them in incidents
             logic.setdefault("_step_id", step.get("id") or alias)
             logic.setdefault("_pipeline_name", step.get("pipeline_name", "unknown"))
+            logic.setdefault("_source_inputs", step.get("source_inputs") or [])
             result = self._apply_validate(source_df, logic)
         elif step_type == "select":
             result = self._apply_select(source_df, logic)
@@ -1073,25 +1437,59 @@ class MainframeTransformationExecutor:
         """
         rules             = logic.get("rules") or []
         fail_mode         = (logic.get("fail_mode") or "FLAG").upper()
-        # Support both new names (validated_path / error_path) and legacy names
-        error_path          = (logic.get("error_path") or logic.get("error_bucket") or "").strip()
-        validated_path      = (logic.get("validated_path") or logic.get("validation_bucket") or "").strip()
-        # Single named-file output: when set the data is written as one named
-        # file (no part-files, no _SUCCESS) instead of a Parquet directory.
-        validated_file_name = (logic.get("validated_file_name") or "").strip()
-        error_file_name     = (logic.get("error_file_name")     or "").strip()
+        # Map UI alias FLAGGED → FLAG for backward compatibility
+        if fail_mode == "FLAGGED":
+            fail_mode = "FLAG"
+
+        # ── Path resolution (v2 schema or legacy) ──────────────────────────
+        from .config_loader import get_validate_paths as _gvp
+        _iface   = logic.get("_interface_name", "")
+        _settings = logic.get("_settings") or {}
+        validated_path, validated_file_name, error_path, error_file_name = \
+            _gvp(logic, interface_name=_iface, settings=_settings)
+
         # Source input field definitions injected by the runner so validated /
         # error files are written as true fixed-width (same layout as the input).
         _source_fields  = logic.get("_source_fields") or []
         _record_length  = int(logic.get("_record_length") or 0)
         pipeline_name   = logic.get("_pipeline_name", "unknown")
-        step_id           = logic.get("_step_id", "validate")
+        step_id         = logic.get("_step_id", "validate")
 
-        # ── Path partition (frequency / date sub-directory) ─────────────────
-        # Apply the same <path>/<FREQUENCY>/<date> convention used for inputs/outputs.
+        # Header/trailer metadata injected by the runner from fixed-width file processing.
+        _file_metadata  = logic.get("_file_metadata") or {}
+
+        def _reconcile_trailer_count(actual_count: int) -> None:
+            """Warn when a trailer record-count field differs from the actual valid-row count."""
+            for meta_key, meta_vals in _file_metadata.items():
+                if not meta_key.endswith("_trailer"):
+                    continue
+                count_field = next(
+                    (k for k in meta_vals if "count" in k.lower() or "cnt" in k.lower()), None
+                )
+                if not count_field:
+                    continue
+                try:
+                    expected = int(meta_vals[count_field])
+                except (ValueError, TypeError):
+                    continue
+                if expected != actual_count:
+                    LOG.warning(
+                        "[VALIDATE] %s: trailer record count MISMATCH — %s.%s=%d, actual_valid=%d",
+                        step_id, meta_key, count_field, expected, actual_count,
+                    )
+                else:
+                    LOG.info(
+                        "[VALIDATE] %s: trailer record count VERIFIED — %s.%s=%d",
+                        step_id, meta_key, count_field, expected,
+                    )
+
+        # ── Path partition (frequency / date sub-directory) — legacy only ──
+        # V2 schema already has partitioning baked into the paths returned by
+        # get_validate_paths().  Legacy configs still need it applied here.
         _frequency     = (logic.get("frequency")          or "").strip()
         _partition_col = (logic.get("path_partition_col") or "").strip()
-        if _frequency:
+        _has_legacy_path = bool((logic.get("validated_path") or "").strip())
+        if _frequency and _has_legacy_path:
             from .config_loader import _build_partitioned_path as _bpp
             if validated_path:
                 validated_path = _bpp(validated_path, "", _frequency, _partition_col)
@@ -1102,6 +1500,7 @@ class MainframeTransformationExecutor:
         ctrl_file_create  = bool(logic.get("ctrl_file_create", False))
         ctrl_file_name    = (logic.get("ctrl_file_name")   or "").strip()
         ctrl_file_fields  = logic.get("ctrl_file_fields") or []
+        ctrl_include_header = bool(logic.get("ctrl_include_header", False))
         # The control file is co-located with the validated output data.
         # For backward-compat we still honour an explicit ctrl_output_path when
         # present in older configs; otherwise fall back to validated_path.
@@ -1113,19 +1512,341 @@ class MainframeTransformationExecutor:
             from .config_loader import _build_partitioned_path as _bpp
             ctrl_output_path = _bpp(_explicit_ctrl_path, "", _frequency, _partition_col)
 
-        # ── Last Run File Check ──────────────────────────────────────────────
-        last_run_check     = bool(logic.get("last_run_check", False))
+        # ── Last Run / Previous Day File Check ───────────────────────────────
+        # Supports both new `previous_day_check` (auto-derived) and legacy
+        # `last_run_check` (explicit paths).
+        last_run_check     = bool(logic.get("last_run_check", False) or logic.get("previous_day_check", False))
         last_run_file_path = (logic.get("last_run_file_path") or "").strip()
         last_run_file_name = (logic.get("last_run_file_name") or "").strip()
         last_run_frequency = (logic.get("last_run_frequency") or "").strip().upper()
         partition_column   = (logic.get("partition_column") or "").strip()
 
+        if last_run_check and partition_column:
+            LOG.info(
+                "[VALIDATE] last_run_check: using config-provided partition_column='%s' "
+                "(prev-day auto-calc skipped)",
+                partition_column,
+            )
+
+        # Use explicit previous_day_* keys written by the Studio (preferred over auto-derive)
+        # previous_day_file_path points to the curated output of the previous day's run
+        _prev_day_path = (logic.get("previous_day_file_path") or "").strip()
+        _prev_day_name = (logic.get("previous_day_file_name") or "").strip()
+        _prev_day_freq = (logic.get("previous_day_frequency") or "").strip().upper()
+        _is_prev_day_auto = bool(logic.get("previous_day_check", False))
+        if last_run_check and _prev_day_path:
+            last_run_file_path = last_run_file_path or _prev_day_path
+            # In previous_day_check (auto) mode the file name must come from the source
+            # input config — _prev_day_name may hold an output dataset name by mistake.
+            if not _is_prev_day_auto:
+                last_run_file_name = last_run_file_name or _prev_day_name
+            last_run_frequency = last_run_frequency or _prev_day_freq
+            if not partition_column:
+                _holidays = (logic.get("_settings") or {}).get("usa_holidays") or []
+                # Expected previous business day is always relative to today
+                _expected_date = _get_previous_business_day(_holidays)
+                from datetime import date as _dt_date
+                LOG.info(
+                    "[VALIDATE] last_run_check: today=%s  previous_business_day=%s  (holidays=%d)",
+                    _dt_date.today().isoformat(), _expected_date.isoformat(), len(_holidays),
+                )
+                # Build the previous day file path (resolve source dataset name as fallback).
+                _src_cfg          = logic.get("_source_input_config") or {}
+                _anticipated_freq = (last_run_frequency or _prev_day_freq or "").upper()
+                _anticipated_base = last_run_file_path or _prev_day_path or ""
+                # In auto mode fall back to the source input's own dataset name so the
+                # path resolves to the actual raw file, not a bare directory.
+                _anticipated_name = (
+                    last_run_file_name or _prev_day_name
+                    or ((_src_cfg.get("dataset_name") or _src_cfg.get("source_file_name") or "")
+                        if _is_prev_day_auto else "")
+                )
+                if _anticipated_base and _anticipated_freq:
+                    from .config_loader import _build_partitioned_path as _bpp_early
+                    _anticipated_path = _bpp_early(
+                        _anticipated_base, _anticipated_name,
+                        _anticipated_freq, _expected_date.strftime("%Y%m%d"),
+                    )
+                else:
+                    _anticipated_path = _anticipated_base + "/" + _anticipated_name
+                LOG.info(
+                    "[VALIDATE] Previous day file path (expected) → %s",
+                    _anticipated_path,
+                )
+
+                _prev_day_hdr_field = (logic.get("previous_day_header_date_field") or "").strip()
+                if _prev_day_hdr_field:
+                    # ── Validate header date by reading the previous day's actual file ──
+                    _pipeline  = logic.get("_pipeline_name") or ""
+                    _step_id   = logic.get("_step_id") or ""
+                    _hdr_fdef  = next(
+                        (f for f in (_src_cfg.get("header_fields") or [])
+                         if (f.get("name") or "").strip() == _prev_day_hdr_field),
+                        None,
+                    )
+                    if not _hdr_fdef:
+                        _msg = (
+                            f"[VALIDATE] previous_day_header_date_field '{_prev_day_hdr_field}' "
+                            f"not found in source input header_fields — cannot validate previous day."
+                        )
+                        LOG.error(_msg)
+                        _raise_prev_day_check_incident(
+                            pipeline_name=_pipeline, input_name=_step_id,
+                            file_path="", expected_date=_expected_date, actual_date="field_not_found",
+                        )
+                        raise RuntimeError(_msg)
+
+                    # Read the header date from the PREVIOUS DAY'S file (not today's metadata)
+                    _hdr_start  = int(_hdr_fdef.get("start") or 1) - 1   # 0-based
+                    _hdr_length = int(_hdr_fdef.get("length") or 8)
+                    _prev_hdr_line = ""
+                    if _anticipated_path.startswith("file://"):
+                        _prev_local = _anticipated_path[len("file://"):]
+                        try:
+                            with open(_prev_local, "r") as _pf:
+                                _prev_hdr_line = _pf.readline().rstrip("\r\n")
+                            LOG.info(
+                                "[VALIDATE] Read previous day header line from: %s",
+                                _anticipated_path,
+                            )
+                        except (IOError, OSError) as _read_err:
+                            _msg = (
+                                f"[VALIDATE] Job aborted: cannot read previous day file "
+                                f"'{_anticipated_path}': {_read_err}. "
+                                f"Pipeline: '{_pipeline}', Step: '{_step_id}'."
+                            )
+                            LOG.error(_msg)
+                            _raise_prev_day_check_incident(
+                                pipeline_name=_pipeline, input_name=_step_id,
+                                file_path=_anticipated_path, expected_date=_expected_date,
+                                actual_date="FILE_MISSING",
+                            )
+                            raise RuntimeError(_msg)
+                    else:
+                        # S3 / HDFS — use the active Spark session via any loaded dataset
+                        _spark_ds = next(iter(self.dfs.values()), None) if self.dfs else None
+                        _spark_ss = _spark_ds.sparkSession if _spark_ds is not None else None
+                        if _spark_ss is None:
+                            _msg = "[VALIDATE] No Spark session available to read previous day S3 file."
+                            LOG.error(_msg)
+                            raise RuntimeError(_msg)
+                        try:
+                            _prev_rows = (
+                                _spark_ss.read.option("wholetext", "false").text(_anticipated_path)
+                                .withColumn("value", F.regexp_replace(F.col("value"), r"\r$", ""))
+                                .limit(1).select("value").collect()
+                            )
+                            _prev_hdr_line = _prev_rows[0].value if _prev_rows else ""
+                            LOG.info(
+                                "[VALIDATE] Read previous day header line from: %s",
+                                _anticipated_path,
+                            )
+                        except Exception as _read_err:  # noqa: BLE001
+                            _msg = (
+                                f"[VALIDATE] Job aborted: cannot read previous day file "
+                                f"'{_anticipated_path}': {_read_err}. "
+                                f"Pipeline: '{_pipeline}', Step: '{_step_id}'."
+                            )
+                            LOG.error(_msg)
+                            _raise_prev_day_check_incident(
+                                pipeline_name=_pipeline, input_name=_step_id,
+                                file_path=_anticipated_path, expected_date=_expected_date,
+                                actual_date="FILE_MISSING",
+                            )
+                            raise RuntimeError(_msg)
+
+                    _hdr_date_str = (
+                        _prev_hdr_line[_hdr_start:_hdr_start + _hdr_length].strip()
+                        if len(_prev_hdr_line) >= _hdr_start + _hdr_length
+                        else ""
+                    )
+                    LOG.info(
+                        "[VALIDATE] Header date extracted: field='%s', start=%d, length=%d, raw='%s'",
+                        _prev_day_hdr_field, _hdr_start + 1, _hdr_length, _hdr_date_str,
+                    )
+
+                    if not _hdr_date_str:
+                        _msg = (
+                            f"[VALIDATE] Header field '{_prev_day_hdr_field}' could not be extracted "
+                            f"from previous day file '{_anticipated_path}' — cannot validate previous day."
+                        )
+                        LOG.error(_msg)
+                        _raise_prev_day_check_incident(
+                            pipeline_name=_pipeline, input_name=_step_id,
+                            file_path=_anticipated_path, expected_date=_expected_date,
+                            actual_date="header_not_read",
+                        )
+                        raise RuntimeError(_msg)
+
+                    # Parse the header date string
+                    _spark_fmt = (_hdr_fdef.get("format") or "yyyyMMdd").strip()
+                    _py_fmt    = _spark_to_py_strptime(_spark_fmt)
+                    try:
+                        from datetime import datetime as _hdr_dt
+                        _actual_date = _hdr_dt.strptime(_hdr_date_str.strip(), _py_fmt).date()
+                    except ValueError:
+                        _msg = (
+                            f"[VALIDATE] Cannot parse header date '{_hdr_date_str}' "
+                            f"with format '{_py_fmt}' (Spark: '{_spark_fmt}')."
+                        )
+                        LOG.error(_msg)
+                        _raise_prev_day_check_incident(
+                            pipeline_name=_pipeline, input_name=_step_id,
+                            file_path="", expected_date=_expected_date,
+                            actual_date=f"parse_error:{_hdr_date_str}",
+                        )
+                        raise RuntimeError(_msg)
+
+                    # Compare
+                    if _actual_date != _expected_date:
+                        _msg = (
+                            f"[VALIDATE] Previous day check FAILED: "
+                            f"header field '{_prev_day_hdr_field}' = {_actual_date} "
+                            f"but expected previous business day = {_expected_date}."
+                        )
+                        LOG.error(_msg)
+                        _raise_prev_day_check_incident(
+                            pipeline_name=_pipeline, input_name=_step_id,
+                            file_path="", expected_date=_expected_date, actual_date=_actual_date,
+                        )
+                        raise RuntimeError(_msg)
+
+                    LOG.info(
+                        "[VALIDATE] Previous day check PASSED: header field '%s' = %s "
+                        "(expected previous business day = %s).",
+                        _prev_day_hdr_field, _actual_date, _expected_date,
+                    )
+                    partition_column = _actual_date.strftime("%Y%m%d")
+                else:
+                    partition_column = _expected_date.strftime("%Y%m%d")
+                    LOG.info("[VALIDATE] Previous business day resolved to: %s (holidays=%d)", _expected_date, len(_holidays))
+
+        # ── Record Count Check ────────────────────────────────────────────────
+        _rc_check         = bool(logic.get("record_count_check", False))
+        _rc_trailer_field = (logic.get("record_count_trailer_field") or "").strip()
+
+        if _rc_check and _rc_trailer_field:
+            _rc_src_cfg    = logic.get("_source_input_config") or {}
+            _rc_input_name = (_rc_src_cfg.get("name") or "").strip()
+            _rc_trailer    = _file_metadata.get(_rc_input_name + "_trailer") or {}
+
+            # Support hyphen-normalised field names (e.g. RECORD-COUNT stored as RECORD_COUNT)
+            _rc_raw_val = (
+                _rc_trailer.get(_rc_trailer_field)
+                or _rc_trailer.get(_rc_trailer_field.replace("-", "_"))
+                or _rc_trailer.get(_rc_trailer_field.replace("_", "-"))
+            )
+
+            # Build a human-readable path for log / incident messages
+            _rc_base = (logic.get("record_count_file_path") or _rc_src_cfg.get("source_path") or "").rstrip("/")
+            _rc_freq = (logic.get("record_count_frequency") or _rc_src_cfg.get("frequency") or "").upper()
+            _rc_file = (logic.get("record_count_file_name") or _rc_src_cfg.get("dataset_name") or _rc_src_cfg.get("source_file_name") or "")
+            _rc_display_path = f"{_rc_base}/{_rc_freq}/{{YYYYMMDD}}/{_rc_file}" if _rc_freq else f"{_rc_base}/{_rc_file}"
+
+            LOG.info(
+                "[VALIDATE] Record count check enabled — input='%s' trailer_field='%s' path='%s'",
+                _rc_input_name, _rc_trailer_field, _rc_display_path,
+            )
+
+            if _rc_raw_val is None:
+                _msg = (
+                    f"[VALIDATE] record_count_trailer_field '{_rc_trailer_field}' not found in "
+                    f"trailer metadata for input '{_rc_input_name}'. "
+                    f"Available trailer fields: {list(_rc_trailer.keys())}."
+                )
+                LOG.error(_msg)
+                _raise_record_count_check_incident(
+                    pipeline_name=pipeline_name, step_id=step_id,
+                    input_file_path=_rc_display_path, expected_count=-1, actual_count="FIELD_NOT_FOUND",
+                )
+                raise RuntimeError(_msg)
+
+            try:
+                _rc_raw_int = int(str(_rc_raw_val).strip())
+            except (ValueError, TypeError) as _rc_err:
+                _msg = (
+                    f"[VALIDATE] Cannot parse record count value '{_rc_raw_val}' "
+                    f"from trailer field '{_rc_trailer_field}' as integer: {_rc_err}."
+                )
+                LOG.error(_msg)
+                _raise_record_count_check_incident(
+                    pipeline_name=pipeline_name, step_id=step_id,
+                    input_file_path=_rc_display_path, expected_count=-1, actual_count=f"PARSE_ERROR:{_rc_raw_val}",
+                )
+                raise RuntimeError(_msg)
+
+            # The trailer count field is an INCLUSIVE total: it counts the
+            # header row(s), all data rows, and the trailer row(s) itself.
+            # The source DataFrame only contains data rows (header + trailer
+            # are stripped by the runner), so we must subtract header_count
+            # and trailer_count from the raw value to get the data-only
+            # expected count before comparing.
+            _rc_hdr_count = int(_rc_src_cfg.get("header_count") or 0)
+            _rc_trl_count = int(_rc_src_cfg.get("trailer_count") or 0)
+            _rc_expected  = _rc_raw_int - _rc_hdr_count - _rc_trl_count
+
+            LOG.info(
+                "[VALIDATE] Record count: raw trailer value=%d, header_count=%d, "
+                "trailer_count=%d → data-row expected=%d",
+                _rc_raw_int, _rc_hdr_count, _rc_trl_count, _rc_expected,
+            )
+
+            _rc_source_inputs = logic.get("_source_inputs") or []
+            _rc_df = self.dfs.get(_rc_source_inputs[0]) if _rc_source_inputs else None
+            if _rc_df is None:
+                _msg = f"[VALIDATE] Record count check: source input DataFrame not found for step '{step_id}'."
+                LOG.error(_msg)
+                raise RuntimeError(_msg)
+
+            _rc_actual = _rc_df.count()
+
+            if _rc_expected != _rc_actual:
+                _msg = (
+                    f"[VALIDATE] Record count check FAILED: "
+                    f"trailer field '{_rc_trailer_field}' = {_rc_raw_int} "
+                    f"(inclusive total; data-only expected = {_rc_expected}, "
+                    f"header_count={_rc_hdr_count}, trailer_count={_rc_trl_count}) "
+                    f"but actual loaded record count = {_rc_actual}. "
+                    f"Input: '{_rc_display_path}'."
+                )
+                LOG.error(_msg)
+                _raise_record_count_check_incident(
+                    pipeline_name=pipeline_name, step_id=step_id,
+                    input_file_path=_rc_display_path,
+                    expected_count=_rc_expected, actual_count=_rc_actual,
+                )
+                raise RuntimeError(_msg)
+
+            LOG.info(
+                "[VALIDATE] Record count check PASSED: trailer field '%s' = %d "
+                "(inclusive; data-only = %d), actual = %d. Input: '%s'.",
+                _rc_trailer_field, _rc_raw_int, _rc_expected, _rc_actual, _rc_display_path,
+            )
+
+        # Auto-derive from source input config when previous_day_check is set
+        # but explicit last_run fields are still absent
+        if last_run_check and (not last_run_file_path or not last_run_file_name):
+            src_cfg = logic.get("_source_input_config") or {}
+            if src_cfg:
+                last_run_file_name = last_run_file_name or src_cfg.get("dataset_name", "") or src_cfg.get("source_file_name", "")
+                last_run_frequency = last_run_frequency or (src_cfg.get("frequency") or "DAILY").upper()
+                partition_column   = partition_column or "date_sub(current_date(), 1)"
+                # Use raw bucket (yesterday's input file) not curated bucket
+                _raw_bucket     = (_settings.get("raw_bucket_prefix") or "").rstrip("/")
+                _base_bucket    = _raw_bucket
+                if _base_bucket and _iface:
+                    last_run_file_path = f"{_base_bucket}/{_iface}"
+
         if last_run_check:
             if not last_run_file_path or not last_run_file_name:
                 raise RuntimeError(
-                    f"[VALIDATE] last_run_check is enabled in step '{step_id}' but "
-                    f"'last_run_file_path' or 'last_run_file_name' is not configured."
+                    f"[VALIDATE] last_run_check/previous_day_check is enabled in step '{step_id}' but "
+                    f"'last_run_file_path' or 'last_run_file_name' could not be determined. "
+                    f"Ensure the source input has a dataset_name configured."
                 )
+            # Mainframe convention: fixed-width output files use .DAT extension
+            if not last_run_file_name.upper().endswith(".DAT"):
+                last_run_file_name = last_run_file_name + ".DAT"
             # Apply frequency / date-partition to the base path (same convention as
             # input and output files: <base>/<FREQUENCY>/<date>/<file>).
             if last_run_frequency and partition_column:
@@ -1147,7 +1868,7 @@ class MainframeTransformationExecutor:
 
             if not _check_file_exists(full_last_run_path):
                 LOG.error(
-                    "[VALIDATE] Last run date file not found at '%s'. "
+                    "[VALIDATE] Previous day file not found at '%s'. "
                     "Creating ServiceNow incident and aborting job.",
                     full_last_run_path,
                 )
@@ -1158,7 +1879,7 @@ class MainframeTransformationExecutor:
                     partition_column=partition_column,
                 )
                 raise RuntimeError(
-                    f"[VALIDATE] Job aborted: last run date file not found at "
+                    f"[VALIDATE] Job aborted: previous day file not found at "
                     f"'{full_last_run_path}'. Pipeline: '{pipeline_name}', "
                     f"Step: '{step_id}'. A ServiceNow incident has been raised."
                 )
@@ -1214,7 +1935,7 @@ class MainframeTransformationExecutor:
             max_length = rule.get("max_length")
             nullable   = rule.get("nullable", True)   # True = null is allowed
             fmt        = (rule.get("format") or "any").lower()
-            date_fmt   = rule.get("date_format") or rule.get("pattern") or "yyyy-MM-dd"
+            date_fmt   = rule.get("date_format") or rule.get("pattern") or "yyyyMMdd"
             pattern    = rule.get("pattern") or ""
 
             # 1. NULL / EMPTY check ──────────────────────────────────────
@@ -1244,7 +1965,7 @@ class MainframeTransformationExecutor:
                     ).otherwise(F.lit(None).cast("string"))
                 )
             elif data_type == "date":
-                fmt_str = rule.get("date_format") or "yyyy-MM-dd"
+                fmt_str = rule.get("date_format") or "yyyyMMdd"
                 error_exprs.append(
                     F.when(
                         col_ref.isNotNull() &
@@ -1253,7 +1974,7 @@ class MainframeTransformationExecutor:
                     ).otherwise(F.lit(None).cast("string"))
                 )
             elif data_type == "timestamp":
-                fmt_str = rule.get("date_format") or "yyyy-MM-dd HH:mm:ss"
+                fmt_str = rule.get("date_format") or "yyyyMMdd HH:mm:ss"
                 error_exprs.append(
                     F.when(
                         col_ref.isNotNull() &
@@ -1278,7 +1999,7 @@ class MainframeTransformationExecutor:
 
             # 4. FORMAT check ─────────────────────────────────────────────
             if fmt == "date":
-                fmt_str = date_fmt or "yyyy-MM-dd"
+                fmt_str = date_fmt or "yyyyMMdd"
                 error_exprs.append(
                     F.when(
                         col_ref.isNotNull() &
@@ -1352,6 +2073,7 @@ class MainframeTransformationExecutor:
                 )
             if validated_path:
                 valid_count = valid_df.count()
+                _reconcile_trailer_count(valid_count)
                 if _source_fields and validated_file_name:
                     _write_fixed_width_to_path(
                         valid_df, _source_fields, validated_path, validated_file_name, _record_length)
@@ -1362,7 +2084,7 @@ class MainframeTransformationExecutor:
                     valid_count, validated_path
                 )
             if ctrl_file_create and ctrl_output_path:
-                _create_ctrl_file(valid_df, ctrl_file_fields, ctrl_output_path, step_id, ctrl_file_name)
+                _create_ctrl_file(valid_df, ctrl_file_fields, ctrl_output_path, step_id, ctrl_file_name, ctrl_include_header)
             return valid_df
 
         # Build annotated DataFrame for FLAG / ABORT
@@ -1403,6 +2125,7 @@ class MainframeTransformationExecutor:
             # can read from the validated path if needed.
             if validated_path:
                 valid_count = df.count()
+                _reconcile_trailer_count(valid_count)
                 if _source_fields and validated_file_name:
                     _write_fixed_width_to_path(
                         df, _source_fields, validated_path, validated_file_name, _record_length)
@@ -1413,7 +2136,7 @@ class MainframeTransformationExecutor:
                     valid_count, validated_path,
                 )
             if ctrl_file_create and ctrl_output_path:
-                _create_ctrl_file(df, ctrl_file_fields, ctrl_output_path, step_id, ctrl_file_name)
+                _create_ctrl_file(df, ctrl_file_fields, ctrl_output_path, step_id, ctrl_file_name, ctrl_include_header)
             return df
 
         # Default: FLAG — annotate rows, but abort if any are invalid.
@@ -1446,6 +2169,7 @@ class MainframeTransformationExecutor:
         if validated_path:
             valid_df    = annotated.filter(F.col("_is_valid"))
             valid_count = valid_df.count()
+            _reconcile_trailer_count(valid_count)
             if _source_fields and validated_file_name:
                 _write_fixed_width_to_path(
                     valid_df, _source_fields, validated_path, validated_file_name, _record_length)
@@ -1456,5 +2180,5 @@ class MainframeTransformationExecutor:
                 valid_count, validated_path
             )
         if ctrl_file_create and ctrl_output_path:
-            _create_ctrl_file(df, ctrl_file_fields, ctrl_output_path, step_id, ctrl_file_name)
+            _create_ctrl_file(df, ctrl_file_fields, ctrl_output_path, step_id, ctrl_file_name, ctrl_include_header)
         return annotated
