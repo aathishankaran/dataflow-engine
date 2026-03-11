@@ -109,6 +109,24 @@ def _build_spark_session(master: str) -> SparkSession:
     return builder.getOrCreate()
 
 
+def _error_messages(exc: BaseException) -> list[str]:
+    """Walk the exception chain and return clean message strings (no traceback)."""
+    messages: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        msg = str(current).strip()
+        if msg:
+            messages.append(msg)
+        # Follow explicit __cause__ first, then implicit __context__
+        next_exc = current.__cause__
+        if next_exc is None and not current.__suppress_context__:
+            next_exc = current.__context__
+        current = next_exc
+    return messages
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Run mainframe dataflow from config JSON (Python 3.12 / cross-platform)",
@@ -142,34 +160,63 @@ def main() -> None:
         action="store_true",
         help="Load inputs and run transformations only; do not write outputs",
     )
+    parser.add_argument(
+        "--settings",
+        type=Path,
+        default=None,
+        help="Path to settings.json (bucket prefixes for path derivation)",
+    )
     args = parser.parse_args()
 
     config_path = args.config
     if not config_path.exists():
-        raise SystemExit(f"Config file not found: {config_path}")
+        LOG.error("Config file not found: %s", config_path)
+        sys.exit(1)
 
-    base_path = args.base_path or Path(__file__).resolve().parent
+    try:
+        base_path = args.base_path or Path(__file__).resolve().parent
 
-    spark = _build_spark_session(master=args.master)
+        spark = _build_spark_session(master=args.master)
 
-    runner = DataFlowRunner(
-        spark=spark,
-        config_path=config_path,
-        base_path=base_path,
-        use_cobrix=not args.no_cobrix,
-    )
+        import json as _json
+        settings = {}
+        settings_path = args.settings or Path(__file__).resolve().parent / "settings.json"
+        if settings_path.exists():
+            settings = _json.loads(settings_path.read_text(encoding="utf-8"))
+            LOG.info("Loaded settings from %s", settings_path)
 
-    runner.load_inputs()
-    runner.run_transformations()
+        runner = DataFlowRunner(
+            spark=spark,
+            config_path=config_path,
+            base_path=base_path,
+            use_cobrix=not args.no_cobrix,
+            settings=settings,
+        )
 
-    if args.dry_run:
-        LOG.info("Dry run — skipping output writes.")
-        for name, df in runner.output_dfs.items():
-            count = df.count()
-            LOG.info("  %s: %d rows", name, count)
-    else:
-        runner.write_outputs()
-        LOG.info("Dataflow completed. Outputs written.")
+        runner.load_inputs()
+        runner.run_transformations()
+
+        if args.dry_run:
+            LOG.info("Dry run — skipping output writes.")
+            for name, df in runner.output_dfs.items():
+                count = df.count()
+                LOG.info("  %s: %d rows", name, count)
+        else:
+            runner.write_outputs()
+            LOG.info("Dataflow completed. Outputs written.")
+
+    except KeyboardInterrupt:
+        LOG.error("Dataflow interrupted by user.")
+        sys.exit(130)
+    except Exception as exc:
+        sep = "─" * 70
+        LOG.error(sep)
+        LOG.error("DATAFLOW FAILED")
+        LOG.error(sep)
+        for msg in _error_messages(exc):
+            LOG.error("  %s", msg)
+        LOG.error(sep)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
