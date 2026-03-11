@@ -1,0 +1,72 @@
+{
+  "use_llm": false,
+  "input_output_path_prefix": "",
+  "input_dataset_prefix": "",
+  "output_dataset_prefix": "",
+  "llm_base_url": "",
+  "llm_model": "",
+  "llm_timeout_seconds": 600,
+  "config_dir": "",
+  "raw_bucket_prefix": "file:///opt/data/s3/raw/",
+  "validation_bucket_prefix": "file:///opt/data/s3/validated/",
+  "error_bucket_prefix": "file:///opt/data/s3/error/",
+  "curated_bucket_prefix": "file:///opt/data/s3/curated/",
+  "efs_output_prefix": "/tmp/efs-test/output/",
+  "usa_holidays": [
+    {
+      "active": true,
+      "name": "New Year's Day",
+      "date": "2026-01-01"
+    },
+    {
+      "active": true,
+      "name": "Martin Luther King Jr. Day",
+      "date": "2026-01-19"
+    },
+    {
+      "active": true,
+      "name": "Presidents' Day",
+      "date": "2026-02-16"
+    },
+    {
+      "active": true,
+      "name": "Memorial Day",
+      "date": "2026-05-25"
+    },
+    {
+      "active": true,
+      "name": "Juneteenth",
+      "date": "2026-06-19"
+    },
+    {
+      "active": true,
+      "name": "Independence Day",
+      "date": "2026-07-04"
+    },
+    {
+      "active": true,
+      "name": "Labor Day",
+      "date": "2026-09-07"
+    },
+    {
+      "active": true,
+      "name": "Columbus Day",
+      "date": "2026-10-12"
+    },
+    {
+      "active": true,
+      "name": "Veterans Day",
+      "date": "2026-11-11"
+    },
+    {
+      "active": true,
+      "name": "Thanksgiving Day",
+      "date": "2026-11-26"
+    },
+    {
+      "active": true,
+      "name": "Christmas Day",
+      "date": "2026-12-25"
+    }
+  ]
+}
