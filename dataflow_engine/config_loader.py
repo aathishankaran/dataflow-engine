@@ -18,15 +18,48 @@ def load_config(path: str | Path) -> dict[str, Any]:
         {
             "Inputs": {
                 "DD_NAME": {
-                    name, format, source_path, source_file_name, fields,
+                    name,                       # node name / ID
+                    format,                     # FIXED | CSV | PARQUET | DELIMITED
+                    frequency,                  # DAILY | WEEKLY | MONTHLY
+                    dataset_name,               # file name with extension (v2 schema)
+                    record_length,              # total char width per record (FIXED)
+                    header_count,               # header lines to skip (FIXED/DELIMITED)
+                    trailer_count,              # trailer lines to skip (FIXED)
+                    delimiter_char,             # delimiter character (DELIMITED/CSV)
+                    fields: [{                  # column definitions
+                        name, type, start, length,
+                        nullable, format        # format: date/timestamp pattern e.g. "yyyy-MM-dd"
+                    }],
                     control_file_name,          # companion count/control file name
                     has_count_file,             # bool – explicit count-file opt-in
                     count_file_path,            # directory for count file (overrides source_path)
                     count_field_name,           # field inside count file holding expected count
-                    record_length, header_count, trailer_count, ...
+                    source_path, source_file_name,  # v1 schema (legacy)
+                    _schema_file, _test_file, _test_rows  # UI metadata
                 }
             },
-            "Outputs": { "DD_NAME": { ... } },
+            "Outputs": {
+                "DD_NAME": {
+                    name,                       # node name / ID
+                    format,                     # FIXED | PARQUET | CSV | DELIMITED
+                    frequency,                  # DAILY | WEEKLY | MONTHLY
+                    dataset_name,               # output file name with extension
+                    write_mode,                 # OVERWRITE | APPEND
+                    source_inputs,              # list of upstream step aliases
+                    record_length,              # total char width per record (FIXED)
+                    header_count,               # header lines (FIXED)
+                    trailer_count,              # trailer lines (FIXED)
+                    delimiter_char,             # delimiter character (DELIMITED)
+                    ctrl_file_gen,              # bool – generate control file
+                    fields: [{                  # column definitions
+                        name, type, start, length,
+                        nullable, format        # format: date/timestamp pattern
+                    }],
+                    output_columns,             # ordered list of column names to write
+                    control_fields,             # control file field definitions
+                    _schema_file, _test_file, _test_rows  # UI metadata
+                }
+            },
             "Transformations": { "steps": [ { id, type, source_inputs, logic, output_alias } ], ... }
         }
 
@@ -108,10 +141,10 @@ def _resolve_partition_col(partition_col: str) -> str:
 
     Supported expressions (case-insensitive):
         load_date()                            → YYYYMMDD        e.g. 20260301
-        current_date()                         → YYYY-MM-DD      e.g. 2026-03-01
-        date_sub(current_date(), N)            → YYYY-MM-DD      e.g. 2026-02-28
+        current_date()                         → YYYYMMDD        e.g. 20260301
+        date_sub(current_date(), N)            → YYYYMMDD        e.g. 20260228
         date_format(current_date(), 'fmt')     → custom format   e.g. 03-01-2026
-        last_day(current_date())               → YYYY-MM-DD      e.g. 2026-03-31
+        last_day(current_date())               → YYYYMMDD        e.g. 20260331
 
     Anything else is returned as-is so literal values are passed through.
     """
@@ -126,15 +159,15 @@ def _resolve_partition_col(partition_col: str) -> str:
     if low == "load_date()":
         return today.strftime("%Y%m%d")
 
-    # current_date() — standard SQL: YYYY-MM-DD
+    # current_date() — YYYYMMDD (consistent with load_date for file paths)
     if low == "current_date()":
-        return today.strftime("%Y-%m-%d")
+        return today.strftime("%Y%m%d")
 
-    # date_sub(current_date(), N) — N days ago
+    # date_sub(current_date(), N) — N days ago, YYYYMMDD
     m = _re.match(r"date_sub\s*\(\s*current_date\s*\(\s*\)\s*,\s*(\d+)\s*\)", low)
     if m:
         n = int(m.group(1))
-        return (today - _timedelta(days=n)).strftime("%Y-%m-%d")
+        return (today - _timedelta(days=n)).strftime("%Y%m%d")
 
     # date_format(current_date(), 'spark_fmt') — custom format
     m = _re.match(r"date_format\s*\(\s*current_date\s*\(\s*\)\s*,\s*['\"]([^'\"]+)['\"]\s*\)", low)
@@ -149,10 +182,10 @@ def _resolve_partition_col(partition_col: str) -> str:
         except ValueError:
             pass
 
-    # last_day(current_date()) — last calendar day of current month
+    # last_day(current_date()) — last calendar day of current month, YYYYMMDD
     if low == "last_day(current_date())":
         last_day = _calendar.monthrange(today.year, today.month)[1]
-        return today.replace(day=last_day).strftime("%Y-%m-%d")
+        return today.replace(day=last_day).strftime("%Y%m%d")
 
     return expr  # literal — pass through unchanged
 
@@ -190,12 +223,20 @@ def _build_partitioned_path(
     return path
 
 
-def get_input_path(config_input: dict, base_path: str | None = None) -> str:
+def get_input_path(
+    config_input: dict,
+    base_path: str | None = None,
+    *,
+    interface_name: str = "",
+    settings: dict | None = None,
+) -> str:
     """
     Resolve input file path from config.
 
     Priority order:
-      1. source_path + source_file_name  (new schema) — path is enriched with
+      0. dataset_name (v2 schema) — full path derived as
+         <raw_bucket_prefix>/<interface_name>/<FREQUENCY>/<YYYYMMDD>/<dataset_name>
+      1. source_path + source_file_name  (v1 schema) — path is enriched with
          frequency/date partition:  <source_path>/<FREQUENCY>/<YYYYMMDD>/<source_file_name>
       2. path                            (legacy — returned as-is, no partition injection)
       3. s3_path                         (legacy alias)
@@ -204,7 +245,15 @@ def get_input_path(config_input: dict, base_path: str | None = None) -> str:
 
     Relative paths are resolved against base_path so --base-path works correctly.
     """
-    # New schema: source_path + source_file_name with frequency/date partition
+    # V2 schema: dataset_name only (no source_path) — derive full path from settings
+    dataset_name = (config_input.get("dataset_name") or "").strip()
+    if dataset_name and not (config_input.get("source_path") or "").strip():
+        bucket = ((settings or {}).get("raw_bucket_prefix") or "").strip()
+        base = _join_path_parts(bucket, interface_name) if interface_name else bucket
+        frequency = (config_input.get("frequency") or "").strip()
+        return _build_partitioned_path(base, dataset_name, frequency, "load_date()")
+
+    # V1 schema: source_path + source_file_name with frequency/date partition
     source_path = (config_input.get("source_path") or "").strip()
     source_file = (config_input.get("source_file_name") or "").strip()
     if source_path or source_file:
@@ -234,7 +283,115 @@ def get_input_path(config_input: dict, base_path: str | None = None) -> str:
     return config_input.get("dataset", "") or ""
 
 
-def get_control_file_path(config_input: dict, base_path: str | None = None) -> str:
+def _extract_holiday_dates(usa_holidays) -> list:
+    """Extract ISO date strings from either old format (list of strings) or
+    new structured format (list of dicts with active/name/date keys).
+
+    Only entries that are active (active=True, or old string format) are included.
+    """
+    result = []
+    for h in (usa_holidays or []):
+        if isinstance(h, str):
+            result.append(h)
+        elif isinstance(h, dict) and h.get("active", True):
+            d = h.get("date", "")
+            if d:
+                result.append(d)
+    return result
+
+
+def get_previous_business_day(target_date: _date, holidays: list) -> _date:
+    """Return the most-recent business day strictly before *target_date*,
+    skipping weekends and any ISO-format date strings in *holidays*.
+
+    Args:
+        target_date: The reference date (usually today).
+        holidays:    List of ISO-format date strings (``YYYY-MM-DD``) for
+                     USA federal holidays on which no data is delivered.
+
+    Returns:
+        The previous business day as a :class:`datetime.date`.
+
+    Examples:
+        >>> from datetime import date
+        >>> get_previous_business_day(date(2026, 3, 2), [])
+        datetime.date(2026, 2, 27)  # Monday → Friday (skip weekend)
+        >>> get_previous_business_day(date(2026, 7, 6), ['2026-07-04'])
+        datetime.date(2026, 7, 2)   # Mon after 4th-of-July weekend → Thursday
+    """
+    holiday_set: set = set()
+    for h in _extract_holiday_dates(holidays):
+        try:
+            holiday_set.add(_date.fromisoformat(h.strip()))
+        except (ValueError, AttributeError):
+            pass
+    candidate = target_date - _timedelta(days=1)
+    while candidate in holiday_set:  # only skip configured holidays; weekends are valid
+        candidate -= _timedelta(days=1)
+    return candidate
+
+
+def get_input_path_for_date(
+    config_input: dict,
+    partition_date: _date,
+    *,
+    interface_name: str = "",
+    settings: dict | None = None,
+) -> str:
+    """Like :func:`get_input_path` but uses *partition_date* instead of today.
+
+    Used by the previous-day header check to build the path to the prior
+    business day's raw input file.
+
+    Supports V2 (``dataset_name``) and V1 (``source_path`` +
+    ``source_file_name``) schemas.  Falls back to :func:`get_input_path`
+    when neither schema key is present.
+
+    Args:
+        config_input:    Input node config dict.
+        partition_date:  The specific date to inject into the path.
+        interface_name:  Interface / pipeline name (used with V2 schema).
+        settings:        Settings dict containing ``raw_bucket_prefix``.
+
+    Returns:
+        Full path string for the given date.
+    """
+    date_str = partition_date.strftime("%Y%m%d")
+
+    # V2 schema: dataset_name only (no source_path) — derive from settings
+    dataset_name = (config_input.get("dataset_name") or "").strip()
+    if dataset_name and not (config_input.get("source_path") or "").strip():
+        bucket = ((settings or {}).get("raw_bucket_prefix") or "").strip()
+        base = _join_path_parts(bucket, interface_name) if interface_name else bucket
+        frequency = (config_input.get("frequency") or "").strip()
+        path = base
+        if frequency:
+            path = _join_path_parts(path, frequency.upper())
+            path = _join_path_parts(path, date_str)
+        return _join_path_parts(path, dataset_name)
+
+    # V1 schema: source_path + source_file_name with frequency/date partition
+    source_path = (config_input.get("source_path") or "").strip()
+    source_file = (config_input.get("source_file_name") or "").strip()
+    if source_path or source_file:
+        frequency = (config_input.get("frequency") or "").strip()
+        path = source_path
+        if frequency:
+            path = _join_path_parts(path, frequency.upper())
+            path = _join_path_parts(path, date_str)
+        return _join_path_parts(path, source_file)
+
+    # Fallback — use today's path (safe no-op)
+    return get_input_path(config_input, interface_name=interface_name, settings=settings)
+
+
+def get_control_file_path(
+    config_input: dict,
+    base_path: str | None = None,
+    *,
+    interface_name: str = "",
+    settings: dict | None = None,
+) -> str:
     """
     Resolve the control/count file path for fixed-width inputs.
 
@@ -244,7 +401,8 @@ def get_control_file_path(config_input: dict, base_path: str | None = None) -> s
     Priority for the base directory:
       1. count_file_path  (explicit override directory)
       2. source_path      (same directory as the data file)
-      3. count_file_path  (legacy — bare directory, no partition injection)
+      3. raw_bucket_prefix + interface_name  (v2 schema — no source_path)
+      4. count_file_path  (legacy — bare directory, no partition injection)
     """
     frequency     = (config_input.get("frequency")     or "").strip()
     partition_col = (config_input.get("partition_col") or "").strip()
@@ -254,6 +412,10 @@ def get_control_file_path(config_input: dict, base_path: str | None = None) -> s
         # Prefer explicit count_file_path directory if provided
         count_dir  = (config_input.get("count_file_path") or "").strip()
         dir_to_use = count_dir or (config_input.get("source_path") or "").strip()
+        # V2 schema: no source_path — derive from settings
+        if not dir_to_use and interface_name:
+            bucket = ((settings or {}).get("raw_bucket_prefix") or "").strip()
+            dir_to_use = _join_path_parts(bucket, interface_name) if bucket else ""
         # Apply the same frequency/date partition as the data file
         combined = _build_partitioned_path(dir_to_use, control_name, frequency, partition_col)
         return _resolve_path(combined, base_path) if base_path and not _is_absolute_path(combined) else combined
@@ -310,23 +472,46 @@ def get_frequency(config: dict, node_name: str) -> str | None:
     return None
 
 
-def get_output_path(config_output: dict, base_path: str | None = None) -> str:
+def get_output_path(
+    config_output: dict,
+    base_path: str | None = None,
+    *,
+    interface_name: str = "",
+    settings: dict | None = None,
+) -> str:
     """
     Resolve output path from config.
 
-    For the new schema (``source_path`` present) the path is enriched with the
+    For the v2 schema (``dataset_name`` present, no ``source_path``) the path
+    is derived as  <curated_bucket_prefix>/<interface>/<FREQUENCY>/<YYYYMMDD>.
+
+    For the v1 schema (``source_path`` present) the path is enriched with the
     frequency/date partition so the output lands in the correct daily bucket::
 
         <source_path>/<FREQUENCY>/<YYYYMMDD>
 
-    ``target_file_name`` (single-file rename) is handled separately by the
-    runner via ``_coalesce_to_named_file`` and is *not* included here.
+    ``target_file_name`` / ``dataset_name`` (single-file rename) is handled
+    separately by the runner via ``_coalesce_to_named_file`` and is *not*
+    included here.
 
     Legacy keys (``path``, ``s3_path``, ``dataset``) are returned as-is
     without partition injection — this keeps test-mode temp paths unchanged.
 
     Relative paths are resolved against ``base_path``.
     """
+    # V2 schema: dataset_name only (no source_path) — derive from settings
+    dataset_name = (config_output.get("dataset_name") or "").strip()
+    if dataset_name and not (config_output.get("source_path") or "").strip():
+        target_storage = (config_output.get("target_storage") or "s3").lower()
+        if target_storage == "efs":
+            bucket = ((settings or {}).get("efs_output_prefix") or "").strip()
+        else:
+            bucket = ((settings or {}).get("curated_bucket_prefix") or "").strip()
+        base = _join_path_parts(bucket, interface_name) if interface_name else bucket
+        frequency = (config_output.get("frequency") or "").strip()
+        return _build_partitioned_path(base, "", frequency, "load_date()")
+
+    # V1 schema: source_path with frequency/date partition
     source_path = (config_output.get("source_path") or "").strip()
     if source_path:
         frequency     = (config_output.get("frequency")     or "").strip()
@@ -344,3 +529,46 @@ def get_output_path(config_output: dict, base_path: str | None = None) -> str:
     if not path:
         return ""
     return _resolve_path(path, base_path) if base_path and not _is_absolute_path(path) else path
+
+
+def get_validate_paths(
+    logic: dict,
+    *,
+    interface_name: str = "",
+    settings: dict | None = None,
+) -> tuple[str, str, str, str]:
+    """
+    Derive validation output paths for a validate step.
+
+    Returns:
+        (validated_dir, validated_file, error_dir, error_file)
+
+    V2 schema (``dataset_name`` present, no ``validated_path``):
+        validated_dir = <validation_bucket_prefix>/<interface>/<FREQ>/<YYYYMMDD>
+        error_dir     = <error_bucket_prefix>/<interface>/<FREQ>/<YYYYMMDD>
+
+    V1 / legacy schema: returns ``validated_path`` and ``error_path`` as-is.
+    """
+    frequency = (logic.get("frequency") or "").strip()
+    dataset_name = (
+        logic.get("dataset_name") or logic.get("validated_file_name") or ""
+    ).strip()
+    error_dataset = (
+        logic.get("error_dataset_name") or logic.get("error_file_name") or ""
+    ).strip()
+
+    has_legacy = bool((logic.get("validated_path") or "").strip())
+    if dataset_name and not has_legacy:
+        s = settings or {}
+        val_bucket = (s.get("validation_bucket_prefix") or "").strip()
+        err_bucket = (s.get("error_bucket_prefix") or "").strip()
+        val_base = _join_path_parts(val_bucket, interface_name) if interface_name else val_bucket
+        err_base = _join_path_parts(err_bucket, interface_name) if interface_name else err_bucket
+        val_dir = _build_partitioned_path(val_base, "", frequency, "load_date()")
+        err_dir = _build_partitioned_path(err_base, "", frequency, "load_date()")
+        return val_dir, dataset_name, err_dir, error_dataset
+
+    # Legacy
+    val_path = (logic.get("validated_path") or "").strip()
+    err_path = (logic.get("error_path") or "").strip()
+    return val_path, dataset_name, err_path, error_dataset
