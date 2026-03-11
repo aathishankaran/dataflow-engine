@@ -1,0 +1,27 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# macOS
+.DS_Store
+
+# Secrets / local config overrides
+*.env
+.env*
+settings.json
+
+# Spark temp / logs
+spark-warehouse/
+derby.log
+metastore_db/

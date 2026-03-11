@@ -13,11 +13,24 @@ Reads the config JSON and runs the dataflow as explicit steps:
 No Spark SQL is used; all steps use the Spark DataFrame API (filter, join, withColumn, etc.)
 so the pipeline is easy to follow and the config JSON can be edited to change behavior.
 
+Input/Output node properties:
+  name           – node name / ID
+  format         – FIXED | CSV | PARQUET | DELIMITED
+  frequency      – DAILY | WEEKLY | MONTHLY (used for partitioned path layout)
+  dataset_name   – file name with extension (v2 schema — derives path from settings)
+  record_length  – total character width per record (FIXED format)
+  header_count   – number of header lines to skip (FIXED/DELIMITED)
+  trailer_count  – number of trailer lines to skip (FIXED)
+  delimiter_char – field separator character (DELIMITED/CSV)
+  write_mode     – OVERWRITE | APPEND (output only)
+  source_inputs  – list of upstream step aliases (output only)
+
 Schema field properties supported:
   name      – column name (hyphens normalized to underscores internally)
   type      – string | int | long | double | decimal | date | timestamp
   nullable  – bool (default true); used for schema validation / empty-DataFrame creation
-  format    – optional format string (e.g. "yyyy-MM-dd" for date columns)
+  format    – optional format string (e.g. "yyyy-MM-dd" for date columns);
+              used for format-aware type casting on CSV/delimited inputs
   start     – 1-based start position (fixed-width files only)
   length    – character width (fixed-width files only)
 
@@ -36,6 +49,7 @@ import logging
 import os
 import platform
 import sys
+from datetime import date as _date, datetime as _datetime
 from pathlib import Path
 
 from pyspark.sql import SparkSession
@@ -43,12 +57,22 @@ from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
 
-from .config_loader import load_config, get_input_path, get_control_file_path, get_output_path, get_frequency
+from .config_loader import (
+    load_config,
+    get_input_path,
+    get_input_path_for_date,
+    get_previous_business_day,
+    get_control_file_path,
+    get_output_path,
+    get_frequency,
+)
 from .transformations import (
     apply_transformation_step,
     _is_s3_path,
     _raise_input_file_missing_incident,
+    _raise_prev_day_check_incident,
     _create_ctrl_file,
+    _spark_to_py_strptime,
 )
 
 LOG = logging.getLogger(__name__)
@@ -205,14 +229,18 @@ class DataFlowRunner:
         config_path: str | Path,
         base_path: str | Path | None = None,
         use_cobrix: bool = True,
+        settings: dict | None = None,
     ):
         self.spark = spark
         self.config_path = Path(config_path)
         self.base_path = Path(base_path) if base_path else self.config_path.parent
         self.use_cobrix = use_cobrix
         self.config = load_config(self.config_path)
+        self.interface_name = self.config_path.stem
+        self.settings = settings or {}
         self.input_dfs: dict[str, DataFrame] = {}
         self.output_dfs: dict[str, DataFrame] = {}
+        self._file_metadata: dict[str, dict] = {}  # header/trailer field values keyed by "{input_name}_header" / "{input_name}_trailer"
 
     # ─────────────────────────────────────────────────────────────────────────
     # READ INPUTS
@@ -228,7 +256,11 @@ class DataFlowRunner:
           relative / absolute       – used as-is by Spark's local FS
         """
         fmt = (cfg.get("format") or "cobol").lower()
-        raw_path = get_input_path(cfg, str(self.base_path))
+        raw_path = get_input_path(
+            cfg, str(self.base_path),
+            interface_name=self.interface_name, settings=self.settings,
+        )
+        LOG.info("[INPUT] %s: resolved read path → %s (format=%s)", name, raw_path, fmt)
         _configure_s3_if_needed(self.spark, raw_path)
         path = _effective_path(raw_path)
         cobrix_opts = cfg.get("cobrix") or {}
@@ -265,18 +297,69 @@ class DataFlowRunner:
         if fmt == "parquet":
             return self.spark.read.parquet(path)
         if fmt in ("csv", "delimited"):
-            delimiter = cfg.get("delimiter") or ","
-            df = (
-                self.spark.read
-                .option("header", "true")
-                .option("inferSchema", "true")
-                .option("sep", delimiter)
-                .csv(path)
-            )
-            normalized = [c.replace("-", "_") for c in df.columns]
-            if normalized != df.columns:
-                df = df.toDF(*normalized)
-            return df
+            delimiter     = cfg.get("delimiter_char") or cfg.get("delimiter") or ","
+            header_count  = int(cfg.get("header_count")  or 0)
+            trailer_count = int(cfg.get("trailer_count") or 0)
+            if header_count > 0 or trailer_count > 0:
+                # Skip leading/trailing non-data lines using DataFrame window functions
+                # (no RDD lambda, no cloudpickle serialisation).
+                from pyspark.sql.window import Window as _Window
+                txt_df = (
+                    self.spark.read
+                    .option("wholetext", "false")
+                    .text(path)
+                    .withColumn("value", F.regexp_replace(F.col("value"), r"\r$", ""))
+                    .withColumn("_rn", F.row_number().over(
+                        _Window.partitionBy(F.lit(1)).orderBy(F.monotonically_increasing_id())
+                    ) - 1)  # 0-based
+                )
+                keep_from = header_count
+                if trailer_count > 0:
+                    total_lines = txt_df.count()
+                    keep_to = total_lines - trailer_count
+                    LOG.info(
+                        "[CSV] %s: total_lines=%d  skip_header=%d  skip_trailer=%d  keep=[%d, %d)",
+                        name, total_lines, header_count, trailer_count, keep_from, keep_to,
+                    )
+                    kept = txt_df.filter(
+                        (F.col("_rn") >= keep_from) & (F.col("_rn") < keep_to)
+                    )
+                else:
+                    LOG.info("[CSV] %s: skipping %d header line(s)", name, header_count)
+                    kept = txt_df.filter(F.col("_rn") >= keep_from)
+                # Collect filtered lines, write to a temp file, re-read as CSV
+                import tempfile as _tmp, os as _os
+                tmp_csv = _tmp.mktemp(suffix=".csv")
+                try:
+                    filtered_lines = [row.value for row in kept.orderBy("_rn").select("value").collect()]
+                    with open(tmp_csv, "w", encoding="utf-8") as _fh:
+                        _fh.write("\n".join(filtered_lines))
+                    data_df = (
+                        self.spark.read
+                        .option("header", "true")
+                        .option("inferSchema", "true")
+                        .option("sep", delimiter)
+                        .csv(tmp_csv)
+                    )
+                finally:
+                    try:
+                        _os.unlink(tmp_csv)
+                    except Exception:
+                        pass
+            else:
+                data_df = (
+                    self.spark.read
+                    .option("header", "true")
+                    .option("inferSchema", "true")
+                    .option("sep", delimiter)
+                    .csv(path)
+                )
+            normalized = [c.replace("-", "_") for c in data_df.columns]
+            if normalized != data_df.columns:
+                data_df = data_df.toDF(*normalized)
+            # Apply format-aware type casting from field definitions
+            data_df = self._apply_field_formats(data_df, cfg.get("fields") or [])
+            return data_df
         if fmt == "fixed":
             return self._read_fixed_width(name, cfg, path)
 
@@ -309,7 +392,10 @@ class DataFlowRunner:
         header_count    = int(cfg.get("header_count") or 0)
         trailer_count   = int(cfg.get("trailer_count") or 0)
         record_length   = cfg.get("record_length")
-        raw_ctrl_path   = get_control_file_path(cfg, str(self.base_path))
+        raw_ctrl_path   = get_control_file_path(
+            cfg, str(self.base_path),
+            interface_name=self.interface_name, settings=self.settings,
+        )
         count_file_path = _effective_path(raw_ctrl_path) if raw_ctrl_path else ""
         control_fields  = cfg.get("control_fields") or []
 
@@ -324,37 +410,112 @@ class DataFlowRunner:
         )
 
         # ── 2. Skip header / trailer lines ───────────────────────────────────
+        # Use pure DataFrame window functions — no RDD, no Python lambda, no
+        # cloudpickle serialisation.  monotonically_increasing_id() gives a
+        # per-partition row sequence that is stable for single-partition local
+        # files (0, 1, 2 …) and preserves block-read order for multi-partition
+        # S3/HDFS files when used as a sort key for row_number().
+        raw_df_indexed: "DataFrame | None" = None
+        total_lines: "int | None" = None
         if header_count > 0 or trailer_count > 0:
-            # Extract plain strings (not Row objects) so the lambda only
-            # serialises a basic str — avoids cloudpickle Row-class overhead.
-            str_rdd  = raw_df.rdd.map(lambda r: r.value)
-            indexed  = str_rdd.zipWithIndex()          # RDD[(str, long)]
+            from pyspark.sql.window import Window as _Window
+            raw_df_indexed = raw_df.withColumn(
+                "_rn",
+                F.row_number().over(
+                    _Window.partitionBy(F.lit(1)).orderBy(F.monotonically_increasing_id())
+                ) - 1,
+            )  # 0-based row number
             keep_from = header_count
-
             if trailer_count > 0:
-                # Need total count to know where trailers start
-                total_lines = indexed.count()
-                keep_to     = total_lines - trailer_count
+                total_lines = raw_df_indexed.count()
+                keep_to = total_lines - trailer_count
                 LOG.info(
                     "[FIXED] %s: total_lines=%d  skip_header=%d  skip_trailer=%d  keep=[%d, %d)",
                     name, total_lines, header_count, trailer_count, keep_from, keep_to,
                 )
-                filtered = (
-                    indexed
-                    .filter(lambda x: keep_from <= x[1] < keep_to)
-                    .map(lambda x: x[0])
-                )
+                raw_df = raw_df_indexed.filter(
+                    (F.col("_rn") >= keep_from) & (F.col("_rn") < keep_to)
+                ).drop("_rn")
             else:
                 LOG.info("[FIXED] %s: skipping %d header line(s)", name, header_count)
-                filtered = (
-                    indexed
-                    .filter(lambda x: x[1] >= keep_from)
-                    .map(lambda x: x[0])
-                )
+                raw_df = raw_df_indexed.filter(F.col("_rn") >= keep_from).drop("_rn")
 
-            raw_df = self.spark.createDataFrame(
-                filtered.map(lambda v: (v,)), ["value"]
-            )
+        # ── 2b. Extract header / trailer field values as metadata ────────────
+        # Collect via DataFrame.collect() — no RDD lambda, no cloudpickle.
+        header_fields  = cfg.get("header_fields") or []
+        trailer_fields = cfg.get("trailer_fields") or []
+
+        if header_fields and header_count > 0:
+            try:
+                if raw_df_indexed is not None:
+                    hdr_rows = (
+                        raw_df_indexed
+                        .filter(F.col("_rn") < header_count)
+                        .orderBy("_rn")
+                        .select("value")
+                        .collect()
+                    )
+                else:
+                    hdr_rows = (
+                        self.spark.read
+                        .option("wholetext", "false").text(path)
+                        .withColumn("value", F.regexp_replace(F.col("value"), r"\r$", ""))
+                        .limit(header_count)
+                        .select("value").collect()
+                    )
+                hdr_lines = [row.value for row in hdr_rows]
+            except Exception:  # noqa: BLE001
+                hdr_lines = []
+            header_meta: dict = {}
+            for line in hdr_lines:
+                for f in header_fields:
+                    fname  = (f.get("name") or "").replace("-", "_")
+                    start  = int(f.get("start") or 1) - 1
+                    length = int(f.get("length") or 1)
+                    header_meta[fname] = line[start:start + length].strip() if len(line) >= start + length else ""
+            self._file_metadata[name + "_header"] = header_meta
+            LOG.info("[FIXED] %s: header metadata extracted: %s", name, header_meta)
+
+        if trailer_fields and trailer_count > 0:
+            try:
+                if raw_df_indexed is not None and total_lines is not None:
+                    trl_rows = (
+                        raw_df_indexed
+                        .filter(F.col("_rn") >= total_lines - trailer_count)
+                        .orderBy("_rn")
+                        .select("value")
+                        .collect()
+                    )
+                else:
+                    from pyspark.sql.window import Window as _Window
+                    tmp_rn = (
+                        self.spark.read
+                        .option("wholetext", "false").text(path)
+                        .withColumn("value", F.regexp_replace(F.col("value"), r"\r$", ""))
+                        .withColumn("_rn", F.row_number().over(
+                            _Window.partitionBy(F.lit(1)).orderBy(F.monotonically_increasing_id())
+                        ) - 1)
+                    )
+                    n_total = tmp_rn.count()
+                    trl_rows = (
+                        tmp_rn
+                        .filter(F.col("_rn") >= n_total - trailer_count)
+                        .orderBy("_rn")
+                        .select("value")
+                        .collect()
+                    )
+                trl_lines = [row.value for row in trl_rows]
+            except Exception:  # noqa: BLE001
+                trl_lines = []
+            trailer_meta: dict = {}
+            for line in trl_lines:
+                for f in trailer_fields:
+                    fname  = (f.get("name") or "").replace("-", "_")
+                    start  = int(f.get("start") or 1) - 1
+                    length = int(f.get("length") or 1)
+                    trailer_meta[fname] = line[start:start + length].strip() if len(line) >= start + length else ""
+            self._file_metadata[name + "_trailer"] = trailer_meta
+            LOG.info("[FIXED] %s: trailer metadata extracted: %s", name, trailer_meta)
 
         # Filter out blank lines (empty records that are not data)
         raw_df = raw_df.filter(F.length(F.trim(F.col("value"))) > 0)
@@ -381,6 +542,34 @@ class DataFlowRunner:
 
         # ── 4. Extract columns by start / length positions ────────────────────
         if fields:
+            # ── Multi-record COBOL copybook offset detection ────────────────
+            # COBOL copybooks assign ABSOLUTE start positions across all 01-level
+            # groups (HEADER at 1-120, DATA at 121-240, TRAILER at 241-360).
+            # Physical records are separate lines, each starting at position 1.
+            # Detect the mismatch: if min(start) - 1 >= line length, subtract
+            # that offset from every field's start so positions become 1-based.
+            raw_starts = [int(f.get("start") or 1) for f in fields if f.get("start")]
+            if raw_starts:
+                min_start = min(raw_starts)
+                if min_start > 1:
+                    try:
+                        sample_len = raw_df.select(
+                            F.min(F.length(F.col("value"))).alias("_l")
+                        ).collect()[0]["_l"]
+                        if sample_len is not None and min_start - 1 >= sample_len:
+                            offset = min_start - 1
+                            LOG.info(
+                                "[FIXED] %s: multi-record copybook detected "
+                                "(min_start=%d, line_len=%d); adjusting all starts by -%d.",
+                                name, min_start, sample_len, offset,
+                            )
+                            fields = [
+                                {**f, "start": int(f.get("start") or 1) - offset}
+                                for f in fields
+                            ]
+                    except Exception:
+                        pass
+
             # Auto-compute start positions when they are missing (sequential layout)
             auto_start = 1
             select_exprs = []
@@ -398,6 +587,22 @@ class DataFlowRunner:
                     F.trim(F.substring(F.col("value"), start, length)).alias(col_name)
                 )
             df = raw_df.select(*select_exprs)
+
+            # ── 4b. Apply implied decimal scaling for COBOL V-clause fields ──
+            # Raw bytes encode an integer (e.g. "0150000" = PIC 9(5)V99 → 1500.00).
+            # Divide by 10^precision to get the actual decimal value.
+            for _f in fields:
+                _col = (_f.get("name") or "").replace("-", "_")
+                _prec = int(_f.get("precision") or 0)
+                if (_f.get("type") or "string").lower() != "decimal" or _prec <= 0:
+                    continue
+                if _col not in df.columns:
+                    continue
+                _scale = 10 ** _prec
+                df = df.withColumn(
+                    _col,
+                    (F.col(_col).cast(T.LongType()) / F.lit(_scale)).cast(T.DecimalType(18, _prec)),
+                )
 
             # NOTE: All columns are intentionally kept as trimmed strings after
             # extraction.  Fixed-width files are raw text; field 'type' declarations
@@ -458,6 +663,40 @@ class DataFlowRunner:
         LOG.info("[FIXED] %s: loaded %d columns from %s", name, len(fields) if fields else 1, path)
         return df
 
+    def _apply_field_formats(self, df: DataFrame, fields: list[dict]) -> DataFrame:
+        """
+        Apply format-aware type casting based on field definitions.
+
+        For DATE and TIMESTAMP fields with a ``format`` property (e.g.
+        ``"yyyy-MM-dd"``), the column is parsed using ``to_date`` /
+        ``to_timestamp`` with the specified format.  Other typed fields are
+        cast using the standard Spark type mapping.
+
+        Fields not present in the DataFrame are silently skipped.
+        """
+        if not fields:
+            return df
+        df_cols = {c.lower(): c for c in df.columns}
+        for fld in fields:
+            col_name = (fld.get("name") or "").replace("-", "_")
+            if not col_name or col_name.lower() not in df_cols:
+                continue
+            actual_col = df_cols[col_name.lower()]
+            ftype = (fld.get("type") or "string").lower()
+            fmt = (fld.get("format") or "").strip()
+            if ftype == "date" and fmt:
+                df = df.withColumn(actual_col, F.to_date(F.col(actual_col), fmt))
+            elif ftype == "timestamp" and fmt:
+                df = df.withColumn(actual_col, F.to_timestamp(F.col(actual_col), fmt))
+            elif ftype not in ("string", "str", ""):
+                if ftype == "decimal":
+                    _prec = int(fld.get("precision") or 4)
+                    spark_type = T.DecimalType(18, _prec)
+                else:
+                    spark_type = _spark_type(ftype)
+                df = df.withColumn(actual_col, F.col(actual_col).cast(spark_type))
+        return df
+
     # ─────────────────────────────────────────────────────────────────────────
     # WRITE OUTPUTS
     # ─────────────────────────────────────────────────────────────────────────
@@ -502,6 +741,15 @@ class DataFlowRunner:
         df_cols = set(df.columns)
         for c in want:
             if c in df_cols:
+                continue
+            # Try the hyphenated equivalent (e.g. TXN_ID → TXN-ID).
+            # This handles CSV/test-mode inputs where column names preserve hyphens
+            # but out_cols has been normalised to underscores.
+            hyphenated = c.replace("_", "-")
+            if hyphenated in df_cols:
+                df = df.withColumn(c, F.col(hyphenated))
+                df_cols.add(c)
+                LOG.debug("Output: aliased %s from hyphenated source %s", c, hyphenated)
                 continue
             parts = c.split("_")
             for i in range(1, len(parts)):
@@ -593,6 +841,59 @@ class DataFlowRunner:
 
         LOG.info("[TARGET FILE] %s/%s written", output_dir, target_file_name)
 
+    def _eval_hdr_trl_expr(self, df: DataFrame, expr: str, data_count: int) -> str:
+        """Evaluate a header/trailer field expression and return its string value."""
+        if not expr:
+            return ""
+        expr_s = expr.strip()
+        # String literal: 'value'
+        if expr_s.startswith("'") and expr_s.endswith("'") and len(expr_s) >= 2:
+            return expr_s[1:-1]
+        # Numeric literal
+        try:
+            return str(int(expr_s))
+        except ValueError:
+            pass
+        try:
+            return str(float(expr_s))
+        except ValueError:
+            pass
+        # count(*) — use pre-computed count to avoid a second pass
+        if expr_s.lower().replace(" ", "") == "count(*)":
+            return str(data_count)
+        # Try as aggregate or scalar Spark SQL expression
+        try:
+            val = df.selectExpr(f"{expr_s} as _hv").collect()[0][0]
+            return str(val) if val is not None else ""
+        except Exception:  # noqa: BLE001
+            pass
+        # Fallback: scalar (no table scan needed — e.g. current_date(), literals)
+        try:
+            val = self.spark.range(1).selectExpr(f"{expr_s} as _hv").collect()[0][0]
+            return str(val) if val is not None else ""
+        except Exception:  # noqa: BLE001
+            pass
+        return ""
+
+    def _build_hdr_trl_row(self, fields: list, df: DataFrame, record_length: int, data_count: int) -> str:
+        """Build a fixed-width string row from header/trailer field expressions."""
+        parts: list[str] = []
+        for f in fields:
+            val        = self._eval_hdr_trl_expr(df, f.get("expression") or "", data_count)
+            length     = int(f.get("length") or 1)
+            ftype      = (f.get("type") or "string").lower()
+            just_right = bool(f.get("just_right", False))
+            if ftype in ("int", "integer", "long", "bigint", "double", "float", "decimal", "number") or just_right:
+                # Numeric fields and JUSTIFIED RIGHT alphanumeric: right-align
+                piece = val.rjust(length)[:length]
+            else:
+                piece = val.ljust(length)[:length]
+            parts.append(piece)
+        result = "".join(parts)
+        if record_length > 0:
+            result = result[:record_length].ljust(record_length)
+        return result
+
     def _write_fixed_width(self, df: DataFrame, name: str, cfg: dict, path: str, write_mode: str, target_file_name: str = "") -> None:
         """
         Write a DataFrame as a fixed-width flat file.
@@ -615,21 +916,58 @@ class DataFlowRunner:
             df.write.mode(write_mode).option("header", "true").csv(path)
             return
 
+        # ── Positional fallback: if NO config field names match ANY DataFrame column,
+        #    map by index position so data still flows through (e.g. INP_* → OUT_*).
+        data_fields = [f for f in fields
+                       if (f.get("record_type") or "DATA").upper() == "DATA"]
+        matched_count = sum(
+            1 for f in data_fields
+            if (f.get("name") or "").replace("-", "_") in df.columns
+        )
+        if matched_count == 0 and len(df.columns) > 0:
+            LOG.info(
+                "[FIXED OUT] %s: no field names matched DataFrame columns; "
+                "using positional mapping (%d fields, %d df cols)",
+                name, len(data_fields), len(df.columns),
+            )
+            for i, f in enumerate(data_fields):
+                if i >= len(df.columns):
+                    break
+                old_col = df.columns[i]
+                new_col = (f.get("name") or "").replace("-", "_")
+                if old_col != new_col:
+                    df = df.withColumnRenamed(old_col, new_col)
+
         # ── Build a single fixed-width string column ──────────────────────────
         line_expr = None
         for f in fields:
-            col_name = (f.get("name") or "").replace("-", "_")
-            length   = int(f.get("length") or 1)
-            ftype    = (f.get("type") or "string").lower()
+            col_name   = (f.get("name") or "").replace("-", "_")
+            length     = int(f.get("length") or 1)
+            ftype      = (f.get("type") or "string").lower()
+            just_right = bool(f.get("just_right", False))
             if col_name not in df.columns:
                 LOG.warning("[FIXED OUT] %s: column '%s' not in DataFrame; padding blanks", name, col_name)
                 piece = F.lpad(F.lit(""), length, " ")
             elif ftype in ("int", "integer", "long", "bigint", "double", "float", "decimal", "number"):
-                # Numeric: right-justify, truncate if too long
-                piece = F.rpad(
-                    F.substring(F.lpad(F.col(col_name).cast("string"), length, " "), 1, length),
-                    length, " ",
-                )
+                _prec = int(f.get("precision") or 0)
+                if ftype == "decimal" and _prec > 0:
+                    # COBOL implied decimal: multiply by 10^precision → integer representation
+                    # e.g. 1500.00 with precision=2 → 150000 → zero-padded to "0150000"
+                    _scale = 10 ** _prec
+                    _scaled = (F.col(col_name).cast(T.DecimalType(18, _prec)) * F.lit(_scale)).cast(T.LongType())
+                    piece = F.rpad(
+                        F.substring(F.lpad(_scaled.cast("string"), length, "0"), 1, length),
+                        length, " ",
+                    )
+                else:
+                    # Numeric: right-justify with leading spaces, truncate if too long
+                    piece = F.rpad(
+                        F.substring(F.lpad(F.col(col_name).cast("string"), length, " "), 1, length),
+                        length, " ",
+                    )
+            elif just_right:
+                # COBOL JUSTIFIED RIGHT: right-align alphanumeric (leading spaces)
+                piece = F.lpad(F.substring(F.col(col_name).cast("string"), 1, length), length, " ")
             else:
                 # String: left-justify, pad / truncate to length
                 piece = F.rpad(F.substring(F.col(col_name).cast("string"), 1, length), length, " ")
@@ -644,13 +982,24 @@ class DataFlowRunner:
         # ── Prepend / append header and trailer lines ─────────────────────────
         if header_count > 0 or trailer_count > 0:
             fixed_rl = record_length or sum(int(f.get("length") or 1) for f in fields)
-            blank_row = self.spark.createDataFrame([(" " * fixed_rl,)], ["value"])
+            header_fields_cfg = cfg.get("header_fields") or []
+            trailer_fields_cfg = cfg.get("trailer_fields") or []
+            # Pre-compute row count once (used by count(*) expressions)
+            data_count = df.count() if (header_fields_cfg or trailer_fields_cfg) else 0
             parts = []
             for _ in range(header_count):
-                parts.append(blank_row)
+                if header_fields_cfg:
+                    row_str = self._build_hdr_trl_row(header_fields_cfg, df, fixed_rl, data_count)
+                else:
+                    row_str = " " * fixed_rl
+                parts.append(self.spark.range(1).select(F.lit(row_str).alias("value")))
             parts.append(df_fixed)
             for _ in range(trailer_count):
-                parts.append(blank_row)
+                if trailer_fields_cfg:
+                    row_str = self._build_hdr_trl_row(trailer_fields_cfg, df, fixed_rl, data_count)
+                else:
+                    row_str = " " * fixed_rl
+                parts.append(self.spark.range(1).select(F.lit(row_str).alias("value")))
             df_fixed = parts[0]
             for p in parts[1:]:
                 df_fixed = df_fixed.union(p)
@@ -682,7 +1031,7 @@ class DataFlowRunner:
                     self._write_fixed_width(ctrl_df, name + "_ctrl", ctrl_cfg, control_file_path, write_mode)
                 else:
                     # Simple control file — write count as single line
-                    ctrl_df = self.spark.createDataFrame([(str(data_count),)], ["value"])
+                    ctrl_df = self.spark.range(1).select(F.lit(str(data_count)).alias("value"))
                     ctrl_df.write.mode(write_mode).text(control_file_path)
                 LOG.info("[FIXED OUT] %s: wrote control file (%d records) to %s", name, data_count, control_file_path)
             except Exception as ce:
@@ -702,7 +1051,10 @@ class DataFlowRunner:
         align with config and reconciliation.
         """
         fmt        = (cfg.get("format") or "parquet").lower()
-        raw_path   = get_output_path(cfg, str(self.base_path))
+        raw_path   = get_output_path(
+            cfg, str(self.base_path),
+            interface_name=self.interface_name, settings=self.settings,
+        )
         _configure_s3_if_needed(self.spark, raw_path)
         path       = _effective_path(raw_path)
         write_mode = (cfg.get("write_mode") or "overwrite").lower()
@@ -736,7 +1088,10 @@ class DataFlowRunner:
             LOG.warning("Output %s: no configured output columns; writing all columns", name)
 
         # ── Resolve target_file_name (optional single-file rename) ───────────
-        target_file_name = (cfg.get("target_file_name") or "").strip()
+        target_file_name = (cfg.get("target_file_name") or cfg.get("dataset_name") or "").strip()
+        # Mainframe convention: fixed-width / text output files use .DAT extension
+        if target_file_name and fmt in ("fixed", "text") and not target_file_name.upper().endswith(".DAT"):
+            target_file_name = target_file_name + ".DAT"
 
         # ── Write in the requested format ─────────────────────────────────────
         writer = df.write.mode(write_mode)
@@ -749,8 +1104,45 @@ class DataFlowRunner:
             else:
                 writer.parquet(path)
         elif fmt in ("csv", "delimited"):
-            delimiter = cfg.get("delimiter") or ","
-            if target_file_name:
+            delimiter     = cfg.get("delimiter_char") or cfg.get("delimiter") or ","
+            header_count  = int(cfg.get("header_count")  or 0)
+            trailer_count = int(cfg.get("trailer_count") or 0)
+            if header_count > 0 or trailer_count > 0:
+                # Prepend/append blank lines as header/trailer records.
+                # Each blank line is a row of empty delimiter-separated values
+                # matching the number of output columns.
+                col_count  = len(df.columns)
+                blank_line = delimiter.join([""] * col_count)
+                blank_row  = self.spark.range(1).select(F.lit(blank_line).alias("value"))
+                # Build the CSV body as a single text column (no Spark header
+                # since we are manually assembling the file structure).
+                import tempfile as _tmp, os as _os
+                tmp_csv_dir = _tmp.mkdtemp(prefix="_csv_body_")
+                df.coalesce(1).write.mode("overwrite").option("header", "true").option("sep", delimiter).csv(tmp_csv_dir)
+                body_df = self.spark.read.text(tmp_csv_dir)
+                parts = []
+                for _ in range(header_count):
+                    parts.append(blank_row)
+                parts.append(body_df)
+                for _ in range(trailer_count):
+                    parts.append(blank_row)
+                assembled = parts[0]
+                for p in parts[1:]:
+                    assembled = assembled.union(p)
+                LOG.info(
+                    "[CSV OUT] %s: prepending %d header line(s) + appending %d trailer line(s)",
+                    name, header_count, trailer_count,
+                )
+                if target_file_name:
+                    self._coalesce_to_named_file(
+                        lambda sp: assembled.coalesce(1).write.mode(write_mode).text(sp),
+                        path, target_file_name,
+                    )
+                else:
+                    assembled.coalesce(1).write.mode(write_mode).text(path)
+                import shutil as _shutil
+                _shutil.rmtree(tmp_csv_dir, ignore_errors=True)
+            elif target_file_name:
                 self._coalesce_to_named_file(
                     lambda sp: df.coalesce(1).write.mode(write_mode)
                                 .option("header", "true").option("sep", delimiter).csv(sp),
@@ -780,22 +1172,204 @@ class DataFlowRunner:
 
         LOG.info("Wrote %s -> %s/%s", name, path, target_file_name or "(dir)")
 
-        # ── Test-mode safety copy ─────────────────────────────────────────────
-        # test_dataflow.py's _read_outputs() always looks for parquet data at
-        # base_path/output/{name}.  When the original config's source_path was
-        # not cleared (e.g. Flask server hasn't reloaded test_dataflow.py yet),
-        # the output goes to the production path instead of the temp dir.
-        # Write a parquet copy here so _read_outputs() can always find the data.
-        # The "parser_test_" prefix is exclusive to our test temp dirs; this guard
-        # keeps production runs unaffected.
-        if "parser_test_" in str(self.base_path):
-            test_out = str(Path(str(self.base_path)) / "output" / name)
-            if test_out != path.rstrip("/"):
-                try:
-                    df.write.mode("overwrite").parquet(test_out)
-                    LOG.debug("Test copy written to %s", test_out)
-                except Exception as te:
-                    LOG.debug("Could not write test copy for %s: %s", name, te)
+    def _check_previous_day_header(self, input_name: str, cfg: dict) -> None:
+        """
+        Previous-day header check for FIXED-width inputs.
+
+        Reads the previous business day's raw input file, extracts its header
+        date field, and verifies it is exactly one business day before today's
+        header date.  Raises a RuntimeError (aborting the job) and fires a
+        Moogsoft incident when the check fails.
+
+        The check is configured per-input in the config JSON::
+
+            "prev_day_check": {
+                "enabled": true,
+                "header_date_field": "BATCH_DATE"   // must appear in header_fields
+            }
+
+        When ``header_date_field`` is not found in ``header_fields``, or today's
+        header metadata was not captured, the check is skipped with a warning
+        (defensive — avoids false positives from misconfiguration).
+        """
+        pdc = cfg.get("prev_day_check") or {}
+        if not pdc.get("enabled"):
+            return
+
+        date_field_name = (pdc.get("header_date_field") or "").strip()
+        if not date_field_name:
+            LOG.warning(
+                "[PREV-DAY] %s: prev_day_check enabled but header_date_field is not set — skipping.",
+                input_name,
+            )
+            return
+
+        # ── 1. Find field definition in header_fields ──────────────────────
+        header_fields = cfg.get("header_fields") or []
+        field_def = next(
+            (f for f in header_fields if (f.get("name") or "").strip() == date_field_name),
+            None,
+        )
+        if field_def is None:
+            LOG.warning(
+                "[PREV-DAY] %s: header_date_field '%s' not found in header_fields — skipping check.",
+                input_name, date_field_name,
+            )
+            return
+
+        start  = int(field_def.get("start") or 1) - 1   # convert to 0-based
+        length = int(field_def.get("length") or 8)
+        spark_fmt = (field_def.get("format") or "yyyyMMdd").strip()
+        py_fmt = _spark_to_py_strptime(spark_fmt)
+
+        # ── 2. Read today's header date from already-extracted metadata ─────
+        meta = self._file_metadata.get(input_name + "_header") or {}
+        norm_field = date_field_name.replace("-", "_")
+        today_date_str = meta.get(norm_field) or meta.get(date_field_name) or ""
+        if not today_date_str:
+            LOG.warning(
+                "[PREV-DAY] %s: header date field '%s' not found in extracted metadata — skipping check.",
+                input_name, date_field_name,
+            )
+            return
+
+        try:
+            today_header_date: _date = _datetime.strptime(today_date_str, py_fmt).date()
+        except (ValueError, TypeError) as exc:
+            LOG.warning(
+                "[PREV-DAY] %s: cannot parse today's header date '%s' with format '%s' (%s) — skipping check.",
+                input_name, today_date_str, py_fmt, exc,
+            )
+            return
+
+        # ── 3. Compute expected previous business day ───────────────────────
+        holidays = self.settings.get("usa_holidays") or []
+        prev_biz_day = get_previous_business_day(today_header_date, holidays)
+        LOG.info(
+            "[PREV-DAY] %s: today_header=%s  expected_prev=%s",
+            input_name, today_header_date, prev_biz_day,
+        )
+
+        # ── 4. Build path for prev-day file and read its header line ────────
+        prev_path = get_input_path_for_date(
+            cfg, prev_biz_day,
+            interface_name=self.interface_name,
+            settings=self.settings,
+        )
+        LOG.info(
+            "[PREV-DAY] %s: previous day file path → %s",
+            input_name, prev_path,
+        )
+        # Strip "file://" prefix so Spark can read local files
+        spark_prev_path = prev_path
+        if spark_prev_path.startswith("file://"):
+            spark_prev_path = spark_prev_path[7:]
+
+        pipeline_name = self.interface_name
+
+        try:
+            prev_rows = (
+                self.spark.read.option("wholetext", "false").text(spark_prev_path)
+                .withColumn("value", F.regexp_replace(F.col("value"), r"\r$", ""))
+                .limit(1)
+                .select("value")
+                .collect()
+            )
+            prev_lines = [row.value for row in prev_rows]
+        except Exception as exc:  # noqa: BLE001
+            msg = (
+                f"[PREV-DAY] Job aborted: cannot read previous business day's file for input "
+                f"'{input_name}'. Expected path: '{prev_path}'. Error: {exc}. "
+                f"Pipeline: '{pipeline_name}'."
+            )
+            LOG.error(msg)
+            _raise_prev_day_check_incident(
+                pipeline_name=pipeline_name,
+                input_name=input_name,
+                file_path=prev_path,
+                expected_date=prev_biz_day,
+                actual_date="FILE_MISSING",
+            )
+            raise RuntimeError(msg)
+
+        if not prev_lines:
+            msg = (
+                f"[PREV-DAY] Job aborted: previous business day's file for input '{input_name}' "
+                f"at '{prev_path}' is empty (no header line found). "
+                f"Pipeline: '{pipeline_name}'."
+            )
+            LOG.error(msg)
+            _raise_prev_day_check_incident(
+                pipeline_name=pipeline_name,
+                input_name=input_name,
+                file_path=prev_path,
+                expected_date=prev_biz_day,
+                actual_date="EMPTY_FILE",
+            )
+            raise RuntimeError(msg)
+
+        # ── 5. Extract and parse the header date from the prev-day file ─────
+        prev_line = prev_lines[0]
+        prev_date_str = (
+            prev_line[start:start + length].strip()
+            if len(prev_line) >= start + length
+            else ""
+        )
+        if not prev_date_str:
+            msg = (
+                f"[PREV-DAY] Job aborted: cannot extract header date field '{date_field_name}' "
+                f"from previous business day's file '{prev_path}' for input '{input_name}'. "
+                f"Pipeline: '{pipeline_name}'."
+            )
+            LOG.error(msg)
+            _raise_prev_day_check_incident(
+                pipeline_name=pipeline_name,
+                input_name=input_name,
+                file_path=prev_path,
+                expected_date=prev_biz_day,
+                actual_date="FIELD_NOT_FOUND",
+            )
+            raise RuntimeError(msg)
+
+        try:
+            prev_header_date: _date = _datetime.strptime(prev_date_str, py_fmt).date()
+        except (ValueError, TypeError) as exc:
+            msg = (
+                f"[PREV-DAY] Job aborted: cannot parse header date '{prev_date_str}' "
+                f"in previous business day's file '{prev_path}' for input '{input_name}'. "
+                f"Error: {exc}. Pipeline: '{pipeline_name}'."
+            )
+            LOG.error(msg)
+            _raise_prev_day_check_incident(
+                pipeline_name=pipeline_name,
+                input_name=input_name,
+                file_path=prev_path,
+                expected_date=prev_biz_day,
+                actual_date=prev_date_str,
+            )
+            raise RuntimeError(msg)
+
+        # ── 6. Compare and pass / fail ──────────────────────────────────────
+        if prev_header_date != prev_biz_day:
+            msg = (
+                f"[PREV-DAY] Job aborted: previous business day's file for input '{input_name}' "
+                f"has header date {prev_header_date} but expected {prev_biz_day}. "
+                f"File: '{prev_path}'. Pipeline: '{pipeline_name}'."
+            )
+            LOG.error(msg)
+            _raise_prev_day_check_incident(
+                pipeline_name=pipeline_name,
+                input_name=input_name,
+                file_path=prev_path,
+                expected_date=prev_biz_day,
+                actual_date=prev_header_date,
+            )
+            raise RuntimeError(msg)
+
+        LOG.info(
+            "[PREV-DAY] %s: PASSED — previous business day file header date %s matches expected %s.",
+            input_name, prev_header_date, prev_biz_day,
+        )
 
     # ─────────────────────────────────────────────────────────────────────────
     # ORCHESTRATION
@@ -881,6 +1455,9 @@ class DataFlowRunner:
                             f"Pipeline: '{pipeline_name}'."
                         )
             self.input_dfs[name] = df
+            # Previous-day header check (skip in test/parser-test mode)
+            if "parser_test_" not in str(self.base_path):
+                self._check_previous_day_header(name, cfg)
         return self.input_dfs
 
     def _empty_from_schema(self, cfg: dict) -> DataFrame:
@@ -940,6 +1517,8 @@ class DataFlowRunner:
                 # the fallback "unknown" / "validate" placeholders.
                 step["logic"]["_pipeline_name"] = self.config_path.stem
                 step["logic"]["_step_id"]       = step.get("id") or alias
+                step["logic"]["_interface_name"] = self.interface_name
+                step["logic"]["_settings"]       = self.settings
                 for src_name in source_names:
                     # Case-insensitive lookup so that a source_inputs value like
                     # "HOGAN-INPUT" still matches an Inputs key like "Hogan-Input".
@@ -955,6 +1534,10 @@ class DataFlowRunner:
                                 )
                                 break
                     src_cfg = src_cfg or {}
+                    # Inject source input config for previous_day_check derivation
+                    step["logic"]["_source_input_config"] = src_cfg
+                    # Inject header/trailer metadata for reconciliation and expressions
+                    step["logic"]["_file_metadata"] = self._file_metadata
                     src_fields = src_cfg.get("fields") or []
                     if src_fields:
                         step["logic"]["_source_fields"]  = src_fields
@@ -992,50 +1575,63 @@ class DataFlowRunner:
         source_inputs = output_cfg.get("source_inputs") or []
         steps = (self.config.get("Transformations") or {}).get("steps") or []
 
-        # Find the validate step whose output_alias is one of our source_inputs
-        for src_alias in source_inputs:
-            for step in steps:
-                if (
-                    (step.get("output_alias") or step.get("id", "")) == src_alias
-                    and (step.get("type") or "").lower() == "validate"
-                ):
-                    logic = step.get("logic") or {}
-                    if not bool(logic.get("ctrl_file_create", False)):
-                        return  # ctrl file creation not enabled for this step
+        # Find a validate step with ctrl_file_create=True.
+        # Prefer one whose output_alias appears in this output's source_inputs;
+        # fall back to any validate step that ran in this pipeline (present in
+        # output_dfs).  This handles the common case where source_inputs points
+        # to the original input alias rather than the validate step alias.
+        validate_step = None
+        for step in steps:
+            if (step.get("type") or "").lower() != "validate":
+                continue
+            logic = step.get("logic") or {}
+            if not logic.get("ctrl_file_create"):
+                continue
+            step_alias = step.get("output_alias") or step.get("id", "")
+            if step_alias in source_inputs:
+                validate_step = step
+                break                   # exact source_inputs match — highest priority
+            if step_alias in self.output_dfs:
+                validate_step = step    # pipeline ran this step — keep as candidate
 
-                    ctrl_file_name   = (logic.get("ctrl_file_name")   or "").strip()
-                    ctrl_file_fields = logic.get("ctrl_file_fields") or []
-                    if not ctrl_file_name or not ctrl_file_fields:
-                        LOG.debug(
-                            "[CURATED_CTRL] ctrl_file_name or ctrl_file_fields not "
-                            "set on validate step '%s'; skipping curated ctrl file.",
-                            step.get("id"),
-                        )
-                        return
+        if validate_step is None:
+            return
 
-                    # Resolve the curated output directory path (with freq/date partition)
-                    raw_path = get_output_path(output_cfg, str(self.base_path))
-                    curated_path = _effective_path(raw_path)
+        logic            = validate_step.get("logic") or {}
+        ctrl_file_name   = (logic.get("ctrl_file_name")   or "").strip()
+        ctrl_file_fields = logic.get("ctrl_file_fields") or []
+        ctrl_include_hdr = bool(logic.get("ctrl_include_header", False))
+        if not ctrl_file_name or not ctrl_file_fields:
+            LOG.debug(
+                "[CURATED_CTRL] ctrl_file_name or ctrl_file_fields not "
+                "set on validate step '%s'; skipping curated ctrl file.",
+                validate_step.get("id"),
+            )
+            return
 
-                    LOG.info(
-                        "[CURATED_CTRL] Writing ctrl file '%s' to curated path '%s'.",
-                        ctrl_file_name, curated_path,
-                    )
-                    try:
-                        _create_ctrl_file(
-                            df,
-                            ctrl_file_fields,
-                            curated_path,
-                            step_id=step.get("id") or "validate",
-                            ctrl_file_name=ctrl_file_name,
-                        )
-                    except Exception as exc:
-                        LOG.warning(
-                            "[CURATED_CTRL] Failed to write ctrl file '%s' to "
-                            "curated path '%s': %s",
-                            ctrl_file_name, curated_path, exc,
-                        )
-                    return  # done — only one validate step per output
+        # Resolve the curated output directory path (with freq/date partition)
+        raw_path     = get_output_path(output_cfg, str(self.base_path))
+        curated_path = _effective_path(raw_path)
+
+        LOG.info(
+            "[CURATED_CTRL] Writing ctrl file '%s' to curated path '%s'.",
+            ctrl_file_name, curated_path,
+        )
+        try:
+            _create_ctrl_file(
+                df,
+                ctrl_file_fields,
+                curated_path,
+                step_id=validate_step.get("id") or "validate",
+                ctrl_file_name=ctrl_file_name,
+                include_header=ctrl_include_hdr,
+            )
+        except Exception as exc:
+            LOG.warning(
+                "[CURATED_CTRL] Failed to write ctrl file '%s' to "
+                "curated path '%s': %s",
+                ctrl_file_name, curated_path, exc,
+            )
 
     def write_outputs(self) -> None:
         """Write all outputs to configured paths.

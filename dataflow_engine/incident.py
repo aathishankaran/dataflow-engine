@@ -386,6 +386,147 @@ class MoogsoftIncidentConnector:
             service="dataflow",
         )
 
+    def create_prev_day_check_incident(
+        self,
+        pipeline_name: str,
+        input_name: str,
+        file_path: str,
+        expected_date: str,
+        actual_date: str,
+        severity: str = SEVERITY_CRITICAL,
+        tags: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """
+        Convenience wrapper — creates a CRITICAL incident when the previous-day
+        header check fails.
+
+        Either the previous business day's file is missing or its header date
+        does not match the expected business day.
+
+        Parameters
+        ----------
+        pipeline_name : str
+            Name of the dataflow pipeline / configuration.
+        input_name : str
+            The logical input name as defined in the config (e.g. 'HOGAN-INPUT').
+        file_path : str
+            Full path to the previous business day's input file that was checked.
+        expected_date : str
+            ISO-format date string (``YYYY-MM-DD``) that the header should have.
+        actual_date : str
+            ISO-format date string (``YYYY-MM-DD``) actually found in the header.
+        severity : str, optional
+            Incident severity (default ``CRITICAL``).
+        tags : dict, optional
+            Additional tags merged with pipeline/input metadata.
+
+        Returns
+        -------
+        str
+            The ``alert_key`` used in the submitted event.
+        """
+        summary = (
+            f"Previous-day header check failed — pipeline '{pipeline_name}' "
+            f"input '{input_name}' aborted"
+        )
+        description = (
+            f"Pipeline           : {pipeline_name}\n"
+            f"Input              : {input_name}\n"
+            f"Previous Day File  : {file_path}\n"
+            f"Expected Date      : {expected_date}\n"
+            f"Actual Header Date : {actual_date}\n\n"
+            f"The dataflow job was aborted because the previous business day's "
+            f"input file header date does not match the expected date. Please "
+            f"verify that the correct file was delivered and re-run the pipeline."
+        )
+        merged_tags: Dict[str, Any] = {
+            "pipeline":      pipeline_name,
+            "input":         input_name,
+            "prev_day_file": file_path,
+            "expected_date": expected_date,
+            "actual_date":   actual_date,
+        }
+        if tags:
+            merged_tags.update(tags)
+
+        return self.create_incident(
+            summary=summary,
+            description=description,
+            severity=severity,
+            alert_key=f"dataflow.{pipeline_name}.{input_name}.prev_day_check_failed",
+            tags=merged_tags,
+            service="dataflow",
+        )
+
+    def create_record_count_check_incident(
+        self,
+        pipeline_name: str,
+        step_id: str,
+        input_file_path: str,
+        expected_count: str,
+        actual_count: str,
+        severity: str = SEVERITY_CRITICAL,
+        tags: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """
+        Convenience wrapper — creates a CRITICAL incident when the trailer
+        record count does not match the actual number of loaded data records.
+
+        Parameters
+        ----------
+        pipeline_name : str
+            Name of the dataflow pipeline / configuration.
+        step_id : str
+            The validate step ID where the check was performed.
+        input_file_path : str
+            Display path of the input file whose trailer was checked.
+        expected_count : str
+            Record count extracted from the trailer field.
+        actual_count : str
+            Actual number of data records loaded from the input file.
+        severity : str, optional
+            Incident severity (default ``CRITICAL``).
+        tags : dict, optional
+            Additional tags merged with pipeline/step metadata.
+
+        Returns
+        -------
+        str
+            The ``alert_key`` used in the submitted event.
+        """
+        summary = (
+            f"Record count mismatch — pipeline '{pipeline_name}' "
+            f"step '{step_id}' aborted"
+        )
+        description = (
+            f"Pipeline         : {pipeline_name}\n"
+            f"Validate Step    : {step_id}\n"
+            f"Input File       : {input_file_path}\n"
+            f"Expected Count   : {expected_count}\n"
+            f"Actual Count     : {actual_count}\n\n"
+            f"The dataflow job was aborted because the trailer record count does "
+            f"not match the actual number of data records loaded from the input file. "
+            f"Please verify that the input file is complete and re-run the pipeline."
+        )
+        merged_tags: Dict[str, Any] = {
+            "pipeline":       pipeline_name,
+            "step":           step_id,
+            "input_file":     input_file_path,
+            "expected_count": expected_count,
+            "actual_count":   actual_count,
+        }
+        if tags:
+            merged_tags.update(tags)
+
+        return self.create_incident(
+            summary=summary,
+            description=description,
+            severity=severity,
+            alert_key=f"dataflow.{pipeline_name}.{step_id}.record_count_check_failed",
+            tags=merged_tags,
+            service="dataflow",
+        )
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
