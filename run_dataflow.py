@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Run mainframe dataflow from generated config JSON.
-Python 3.12+ compatible.  Runs on Linux, macOS, and Windows.
+Python 3.6.8+ compatible.  Runs on Linux, macOS, and Windows.
 
 Usage:
     python run_dataflow.py samples/config.json
@@ -27,6 +27,7 @@ import os
 import platform
 import sys
 from pathlib import Path
+from typing import List, Optional, Set
 
 # ── import runner FIRST so _configure_spark_for_os() runs before SparkSession
 from dataflow_engine.runner import DataFlowRunner, _IS_WINDOWS, _IS_MACOS, _IS_LINUX
@@ -109,11 +110,11 @@ def _build_spark_session(master: str) -> SparkSession:
     return builder.getOrCreate()
 
 
-def _error_messages(exc: BaseException) -> list[str]:
+def _error_messages(exc: BaseException) -> List[str]:
     """Walk the exception chain and return clean message strings (no traceback)."""
-    messages: list[str] = []
-    seen: set[int] = set()
-    current: BaseException | None = exc
+    messages: List[str] = []
+    seen: Set[int] = set()
+    current: Optional[BaseException] = exc
     while current is not None and id(current) not in seen:
         seen.add(id(current))
         msg = str(current).strip()
@@ -129,7 +130,7 @@ def _error_messages(exc: BaseException) -> list[str]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run mainframe dataflow from config JSON (Python 3.12 / cross-platform)",
+        description="Run mainframe dataflow from config JSON (Python 3.6.8+ / cross-platform)",
     )
     parser.add_argument(
         "config",

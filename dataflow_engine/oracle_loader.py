@@ -35,15 +35,13 @@ Environment / prerequisites
 - The ``VAULT_ADDR`` / ``VAULT_TOKEN`` (or AppRole) env vars must be set.
 """
 
-from __future__ import annotations
-
 import logging
 import os
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional
 
 from pyspark.sql import DataFrame
 
@@ -55,7 +53,7 @@ LOG = logging.getLogger(__name__)
 # SQL*Loader constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-_LOAD_MODE_MAP: dict[str, str] = {
+_LOAD_MODE_MAP: Dict[str, str] = {
     "INSERT":          "INSERT",
     "APPEND":          "APPEND",
     "TRUNCATE_INSERT": "TRUNCATE",
@@ -63,7 +61,7 @@ _LOAD_MODE_MAP: dict[str, str] = {
 }
 
 # Spark simple-string type → SQL*Loader field directive
-_SPARK_TO_SQLLDR: dict[str, str] = {
+_SPARK_TO_SQLLDR: Dict[str, str] = {
     "string":    "CHAR",
     "integer":   "INTEGER EXTERNAL",
     "int":       "INTEGER EXTERNAL",
@@ -172,8 +170,8 @@ def write_df_to_oracle(
 def generate_ctl_content(
     table_name: str,
     schema: str,
-    columns: list[str],
-    spark_types: list[str],
+    columns: List[str],
+    spark_types: List[str],
     load_mode: str = "APPEND",
     bad_file: str = "/tmp/sqlldr/output.bad",
     log_file: str = "/tmp/sqlldr/output.log",
@@ -203,7 +201,7 @@ def generate_ctl_content(
 
     discard_line = f"\nDISCARDFILE '{discard_file}'" if discard_file else ""
 
-    field_lines: list[str] = []
+    field_lines: List[str] = []
     for col, stype in zip(columns, spark_types):
         base_type = stype.lower().split("(")[0].strip()   # "decimal(18,4)" → "decimal"
         sqlldr_type = _SPARK_TO_SQLLDR.get(base_type, "CHAR")

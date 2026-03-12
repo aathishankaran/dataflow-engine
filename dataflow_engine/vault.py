@@ -19,11 +19,9 @@ Secret format (KV v2 example):
   vault kv put secret/oracle/prod username="svc_acct" password="s3cr3t"
 """
 
-from __future__ import annotations
-
 import logging
 import os
-from typing import Optional
+from typing import Optional, Tuple
 
 LOG = logging.getLogger(__name__)
 
@@ -36,7 +34,7 @@ def get_oracle_credentials(
     vault_path: str,
     username_key: str = "username",
     password_key: str = "password",
-) -> tuple[str, str]:
+) -> Tuple[str, str]:
     """Read Oracle credentials from HashiCorp Vault.
 
     Parameters
@@ -177,7 +175,7 @@ def _build_vault_client():
     return client
 
 
-def _split_kv_path(vault_path: str) -> tuple[str, str]:
+def _split_kv_path(vault_path: str) -> Tuple[str, str]:
     """Split a Vault KV path into (mount_point, secret_path).
 
     Examples
