@@ -33,8 +33,6 @@ MOOGSOFT_API_KEY    Bearer / token credential for Moogsoft authentication.
 MOOGSOFT_TIMEOUT    HTTP request timeout in seconds (default: 30).
 """
 
-from __future__ import annotations
-
 import json
 import logging
 import os

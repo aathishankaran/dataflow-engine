@@ -13,7 +13,7 @@ import os
 import re
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
@@ -42,17 +42,17 @@ def _extract_holiday_dates(usa_holidays) -> list:
 
 def _get_previous_business_day(holidays=None, reference_date=None) -> "date":
     """Return the previous calendar day before *reference_date* (defaults to today),
-    skipping only dates listed in the supplied holidays.  Weekends are treated as
-    valid business days — only explicit holidays are skipped.
+    skipping only dates listed in the supplied holidays.
+    Weekends are treated as valid days — files are loaded every day of the week.
 
     Args:
         holidays: List of ISO date strings OR list of dicts {active, name, date}.
         reference_date: The date to look back from (defaults to date.today()).
     """
     from datetime import date, timedelta
-    holiday_set: set[str] = set(_extract_holiday_dates(holidays))
+    holiday_set: Set[str] = set(_extract_holiday_dates(holidays))
     d = (reference_date or date.today()) - timedelta(days=1)
-    while d.isoformat() in holiday_set:  # only skip configured holidays
+    while d.isoformat() in holiday_set:
         d -= timedelta(days=1)
     return d
 
@@ -197,7 +197,7 @@ def _write_df_to_path(df: DataFrame, path: str, mode: str = "append", file_name:
 
 def _write_fixed_width_to_path(
     df: "DataFrame",
-    fields: list[dict],
+    fields: List[dict],
     path: str,
     file_name: str,
     record_length: int = 0,
@@ -630,7 +630,7 @@ def _raise_record_count_check_incident(
 
 def _create_ctrl_file(
     df: "DataFrame",
-    ctrl_file_fields: list[dict],
+    ctrl_file_fields: List[dict],
     ctrl_output_path: str,
     step_id: str = "validate",
     ctrl_file_name: str = "",
@@ -870,7 +870,7 @@ def _create_ctrl_file(
 
 
 def _raise_moogsoft_incident(pipeline_name: str, step_id: str, invalid_count: int,
-                              error_samples: list | None = None) -> None:
+                              error_samples: Optional[list] = None) -> None:
     """
     Fire a MoogSoft/ServiceNow incident for validation failure.
 
@@ -1005,8 +1005,8 @@ def _parse_condition(cond: str, df: DataFrame):
 
 def apply_transformation_step(
     step: dict,
-    datasets: dict[str, "DataFrame"],
-) -> tuple[str | None, DataFrame | None]:
+    datasets: Dict[str, "DataFrame"],
+) -> Tuple[Optional[str], Optional["DataFrame"]]:
     """
     Apply one transformation step: resolve source dataset(s) from the registry,
     run a single Spark DataFrame transformation (filter, join, aggregate, select, etc.),
@@ -1023,7 +1023,7 @@ class MainframeTransformationExecutor:
     runs the Spark transformation for this step type, returns the result.
     """
 
-    def __init__(self, dfs: dict[str, DataFrame]):
+    def __init__(self, dfs: Dict[str, DataFrame]):
         """
         Args:
             dfs: Registry of named DataFrames (inputs + outputs of previous steps).
@@ -1031,7 +1031,7 @@ class MainframeTransformationExecutor:
         """
         self.dfs = dfs  # use same dict so step output is visible to next step
 
-    def apply_step(self, step: dict) -> tuple[str | None, DataFrame | None]:
+    def apply_step(self, step: dict) -> Tuple[Optional[str], Optional["DataFrame"]]:
         """
         Apply a single transformation step.
 
@@ -1047,7 +1047,7 @@ class MainframeTransformationExecutor:
         alias = step.get("output_alias") or step.get("id", "out")
 
         # Resolve source dataframe(s)
-        source_df: DataFrame | None = None
+        source_df: Optional[DataFrame] = None
         for name in source_names:
             if name in self.dfs:
                 source_df = self.dfs[name]
@@ -1056,7 +1056,7 @@ class MainframeTransformationExecutor:
             LOG.warning("No source found for step %s, sources: %s", step.get("id"), source_names)
             return None, None
 
-        result: DataFrame | None = None
+        result: Optional[DataFrame] = None
 
         if step_type == "filter":
             result = self._apply_filter(source_df, logic)
@@ -1139,7 +1139,7 @@ class MainframeTransformationExecutor:
             return df.filter(cond_expr)
         return df
 
-    def _apply_join(self, logic: dict) -> DataFrame | None:
+    def _apply_join(self, logic: dict) -> Optional[DataFrame]:
         left_name = logic.get("left")
         right_name = logic.get("right")
         on_spec = logic.get("on") or []
@@ -1209,7 +1209,7 @@ class MainframeTransformationExecutor:
             return df.groupBy(*g_cols).agg(*agg_exprs)
         return df.agg(*agg_exprs)
 
-    def _apply_union(self, logic: dict, step: dict | None = None) -> DataFrame | None:
+    def _apply_union(self, logic: dict, step: Optional[dict] = None) -> Optional[DataFrame]:
         source_names = logic.get("source_inputs") or (step.get("source_inputs") if step else [])
         frames = [self.dfs[n] for n in source_names if n in self.dfs]
         if len(frames) < 2:
@@ -1225,7 +1225,7 @@ class MainframeTransformationExecutor:
         cols = [F.col(_resolve_col(df, _col(k))) for k in key]
         return df.orderBy(*cols, ascending=asc)
 
-    def _apply_merge(self, logic: dict, step: dict | None = None) -> DataFrame | None:
+    def _apply_merge(self, logic: dict, step: Optional[dict] = None) -> Optional[DataFrame]:
         return self._apply_union(logic, step)
 
     def _apply_select(self, df: DataFrame, logic: dict) -> DataFrame:
@@ -1543,11 +1543,12 @@ class MainframeTransformationExecutor:
             last_run_frequency = last_run_frequency or _prev_day_freq
             if not partition_column:
                 _holidays = (logic.get("_settings") or {}).get("usa_holidays") or []
-                # Expected previous business day is always relative to today
+                # Expected previous business day — skips holidays only.
+                # Weekends are valid days (files are loaded every day).
                 _expected_date = _get_previous_business_day(_holidays)
                 from datetime import date as _dt_date
                 LOG.info(
-                    "[VALIDATE] last_run_check: today=%s  previous_business_day=%s  (holidays=%d)",
+                    "[VALIDATE] last_run_check: today=%s  expected_prev=%s  (holidays=%d)",
                     _dt_date.today().isoformat(), _expected_date.isoformat(), len(_holidays),
                 )
                 # Build the previous day file path (resolve source dataset name as fallback).
@@ -1684,16 +1685,35 @@ class MainframeTransformationExecutor:
                     try:
                         from datetime import datetime as _hdr_dt
                         _actual_date = _hdr_dt.strptime(_hdr_date_str.strip(), _py_fmt).date()
-                    except ValueError:
-                        _msg = (
-                            f"[VALIDATE] Cannot parse header date '{_hdr_date_str}' "
-                            f"with format '{_py_fmt}' (Spark: '{_spark_fmt}')."
+                    except ValueError as _parse_exc:
+                        # Distinguish impossible calendar dates (Feb 30, Apr 31 …)
+                        # from genuine format mismatches (wrong chars / length).
+                        # Python raises messages like "day is out of range for month"
+                        # or "month must be in 1..12" for non-existent dates.
+                        _exc_lower = str(_parse_exc).lower()
+                        _is_impossible_date = any(
+                            k in _exc_lower
+                            for k in ("out of range", "day is", "month must", "invalid date")
                         )
+                        if _is_impossible_date:
+                            _msg = (
+                                f"[VALIDATE] Invalid calendar date in header field "
+                                f"'{_prev_day_hdr_field}': '{_hdr_date_str}' does not "
+                                f"exist in the calendar (e.g. February has no day 30). "
+                                f"Format: '{_spark_fmt}'."
+                            )
+                            _incident_actual = f"INVALID_DATE:{_hdr_date_str}"
+                        else:
+                            _msg = (
+                                f"[VALIDATE] Cannot parse header date '{_hdr_date_str}' "
+                                f"with format '{_py_fmt}' (Spark: '{_spark_fmt}')."
+                            )
+                            _incident_actual = f"parse_error:{_hdr_date_str}"
                         LOG.error(_msg)
                         _raise_prev_day_check_incident(
                             pipeline_name=_pipeline, input_name=_step_id,
                             file_path="", expected_date=_expected_date,
-                            actual_date=f"parse_error:{_hdr_date_str}",
+                            actual_date=_incident_actual,
                         )
                         raise RuntimeError(_msg)
 
@@ -1888,7 +1908,7 @@ class MainframeTransformationExecutor:
 
         # ── format → regex pattern map ──────────────────────────────────
         # Both lowercase (legacy) and uppercase (new UI) forms are supported.
-        FORMAT_PATTERNS: dict[str, str] = {
+        FORMAT_PATTERNS: Dict[str, str] = {
             "alpha":        r"^[A-Za-z\s]+$",
             "ALPHA":        r"^[A-Za-z\s]+$",
             "numeric":      r"^\d+(\.\d+)?$",

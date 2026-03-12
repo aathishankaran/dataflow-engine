@@ -7,10 +7,10 @@ import json
 import re as _re
 from datetime import date as _date, timedelta as _timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 
-def load_config(path: str | Path) -> dict[str, Any]:
+def load_config(path: Union[str, Path]) -> Dict[str, Any]:
     """
     Load dataflow configuration from JSON file.
 
@@ -117,7 +117,7 @@ def _is_absolute_path(p: str) -> bool:
     return False
 
 
-def _resolve_path(path: str, base_path: str | None) -> str:
+def _resolve_path(path: str, base_path: Optional[str]) -> str:
     """Resolve path against base_path when path is relative."""
     if not path or not base_path or _is_absolute_path(path):
         return path or ""
@@ -225,10 +225,10 @@ def _build_partitioned_path(
 
 def get_input_path(
     config_input: dict,
-    base_path: str | None = None,
+    base_path: Optional[str] = None,
     *,
     interface_name: str = "",
-    settings: dict | None = None,
+    settings: Optional[dict] = None,
 ) -> str:
     """
     Resolve input file path from config.
@@ -319,11 +319,12 @@ def get_previous_business_day(target_date: _date, holidays: list) -> _date:
         >>> get_previous_business_day(date(2026, 7, 6), ['2026-07-04'])
         datetime.date(2026, 7, 2)   # Mon after 4th-of-July weekend → Thursday
     """
-    holiday_set: set = set()
+    holiday_set = set()  # type: set
     for h in _extract_holiday_dates(holidays):
         try:
-            holiday_set.add(_date.fromisoformat(h.strip()))
-        except (ValueError, AttributeError):
+            parts = h.strip().split("-")
+            holiday_set.add(_date(int(parts[0]), int(parts[1]), int(parts[2])))
+        except (ValueError, AttributeError, IndexError):
             pass
     candidate = target_date - _timedelta(days=1)
     while candidate in holiday_set:  # only skip configured holidays; weekends are valid
@@ -336,7 +337,7 @@ def get_input_path_for_date(
     partition_date: _date,
     *,
     interface_name: str = "",
-    settings: dict | None = None,
+    settings: Optional[dict] = None,
 ) -> str:
     """Like :func:`get_input_path` but uses *partition_date* instead of today.
 
@@ -387,10 +388,10 @@ def get_input_path_for_date(
 
 def get_control_file_path(
     config_input: dict,
-    base_path: str | None = None,
+    base_path: Optional[str] = None,
     *,
     interface_name: str = "",
-    settings: dict | None = None,
+    settings: Optional[dict] = None,
 ) -> str:
     """
     Resolve the control/count file path for fixed-width inputs.
@@ -427,7 +428,7 @@ def get_control_file_path(
     return ""
 
 
-def get_count_file_path(config_input: dict, base_path: str | None = None) -> str:
+def get_count_file_path(config_input: dict, base_path: Optional[str] = None) -> str:
     """
     Resolve the count file path when the input has an explicit count file
     (``has_count_file = true`` in the config JSON).
@@ -449,7 +450,7 @@ def has_count_file(config_input: dict) -> bool:
     return bool((config_input.get("control_file_name") or "").strip())
 
 
-def get_frequency(config: dict, node_name: str) -> str | None:
+def get_frequency(config: dict, node_name: str) -> Optional[str]:
     """
     Return the frequency string (e.g. DAILY / WEEKLY / MONTHLY) for a named
     input or output node, or None if the attribute is absent.
@@ -474,10 +475,10 @@ def get_frequency(config: dict, node_name: str) -> str | None:
 
 def get_output_path(
     config_output: dict,
-    base_path: str | None = None,
+    base_path: Optional[str] = None,
     *,
     interface_name: str = "",
-    settings: dict | None = None,
+    settings: Optional[dict] = None,
 ) -> str:
     """
     Resolve output path from config.
@@ -535,8 +536,8 @@ def get_validate_paths(
     logic: dict,
     *,
     interface_name: str = "",
-    settings: dict | None = None,
-) -> tuple[str, str, str, str]:
+    settings: Optional[dict] = None,
+) -> Tuple[str, str, str, str]:
     """
     Derive validation output paths for a validate step.
 

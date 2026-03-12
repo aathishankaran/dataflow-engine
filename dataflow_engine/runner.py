@@ -1,6 +1,6 @@
 """
 PySpark Dataflow Runner - configuration-driven, step-by-step execution.
-Python 3.12+ / Cross-platform (Linux, macOS, Windows).
+Python 3.6.8+ / Cross-platform (Linux, macOS, Windows).
 
 Reads the config JSON and runs the dataflow as explicit steps:
   1. Load all Inputs into a registry of named DataFrames.
@@ -51,6 +51,7 @@ import platform
 import sys
 from datetime import date as _date, datetime as _datetime
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Union
 
 from pyspark.sql import SparkSession
 from pyspark.sql import DataFrame
@@ -192,7 +193,7 @@ def _effective_path(path: str) -> str:
     return _normalise_path(path)
 
 # ── Spark type mapping ────────────────────────────────────────────────────────
-_SPARK_TYPE_MAP: dict[str, T.DataType] = {
+_SPARK_TYPE_MAP: Dict[str, T.DataType] = {
     "string":    T.StringType(),
     "str":       T.StringType(),
     "int":       T.IntegerType(),
@@ -226,10 +227,10 @@ class DataFlowRunner:
     def __init__(
         self,
         spark: SparkSession,
-        config_path: str | Path,
-        base_path: str | Path | None = None,
+        config_path: Union[str, Path],
+        base_path: Optional[Union[str, Path]] = None,
         use_cobrix: bool = True,
-        settings: dict | None = None,
+        settings: Optional[dict] = None,
     ):
         self.spark = spark
         self.config_path = Path(config_path)
@@ -238,9 +239,9 @@ class DataFlowRunner:
         self.config = load_config(self.config_path)
         self.interface_name = self.config_path.stem
         self.settings = settings or {}
-        self.input_dfs: dict[str, DataFrame] = {}
-        self.output_dfs: dict[str, DataFrame] = {}
-        self._file_metadata: dict[str, dict] = {}  # header/trailer field values keyed by "{input_name}_header" / "{input_name}_trailer"
+        self.input_dfs: Dict[str, DataFrame] = {}
+        self.output_dfs: Dict[str, DataFrame] = {}
+        self._file_metadata: Dict[str, dict] = {}  # header/trailer field values keyed by "{input_name}_header" / "{input_name}_trailer"
 
     # ─────────────────────────────────────────────────────────────────────────
     # READ INPUTS
@@ -415,8 +416,8 @@ class DataFlowRunner:
         # per-partition row sequence that is stable for single-partition local
         # files (0, 1, 2 …) and preserves block-read order for multi-partition
         # S3/HDFS files when used as a sort key for row_number().
-        raw_df_indexed: "DataFrame | None" = None
-        total_lines: "int | None" = None
+        raw_df_indexed: Optional[DataFrame] = None
+        total_lines: Optional[int] = None
         if header_count > 0 or trailer_count > 0:
             from pyspark.sql.window import Window as _Window
             raw_df_indexed = raw_df.withColumn(
@@ -663,7 +664,7 @@ class DataFlowRunner:
         LOG.info("[FIXED] %s: loaded %d columns from %s", name, len(fields) if fields else 1, path)
         return df
 
-    def _apply_field_formats(self, df: DataFrame, fields: list[dict]) -> DataFrame:
+    def _apply_field_formats(self, df: DataFrame, fields: List[dict]) -> DataFrame:
         """
         Apply format-aware type casting based on field definitions.
 
@@ -701,7 +702,7 @@ class DataFlowRunner:
     # WRITE OUTPUTS
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _output_columns_from_config(self, cfg: dict, df: DataFrame) -> list[str] | None:
+    def _output_columns_from_config(self, cfg: dict, df: DataFrame) -> Optional[List[str]]:
         """Return ordered list of underscore-normalised column names to write.
 
         Priority:
@@ -736,7 +737,7 @@ class DataFlowRunner:
         want = [f.get("name", "").replace("-", "_") for f in fields if f.get("name")]
         return want or None
 
-    def _ensure_output_columns(self, df: DataFrame, want: list[str]) -> DataFrame:
+    def _ensure_output_columns(self, df: DataFrame, want: List[str]) -> DataFrame:
         """Ensure df has all wanted columns; alias from a matching source column if missing."""
         df_cols = set(df.columns)
         for c in want:
@@ -877,7 +878,7 @@ class DataFlowRunner:
 
     def _build_hdr_trl_row(self, fields: list, df: DataFrame, record_length: int, data_count: int) -> str:
         """Build a fixed-width string row from header/trailer field expressions."""
-        parts: list[str] = []
+        parts: List[str] = []
         for f in fields:
             val        = self._eval_hdr_trl_expr(df, f.get("expression") or "", data_count)
             length     = int(f.get("length") or 1)
@@ -1375,7 +1376,7 @@ class DataFlowRunner:
     # ORCHESTRATION
     # ─────────────────────────────────────────────────────────────────────────
 
-    def load_inputs(self) -> dict[str, DataFrame]:
+    def load_inputs(self) -> Dict[str, DataFrame]:
         """Load all inputs from config."""
         inputs = self.config.get("Inputs") or {}
         base   = str(self.base_path)
@@ -1486,14 +1487,14 @@ class DataFlowRunner:
         # (also JVM-side) — no cloudpickle, no stack-overflow on Python 3.14.
         return self.spark.range(0).select(*col_exprs)
 
-    def run_transformations(self) -> dict[str, DataFrame]:
+    def run_transformations(self) -> Dict[str, DataFrame]:
         """
         Execute transformation steps one by one.
         Each step reads its source dataset(s) from the registry, applies a Spark DataFrame
         transformation, and stores the result under output_alias so the next step can use it.
         """
         steps    = (self.config.get("Transformations") or {}).get("steps") or []
-        datasets : dict[str, DataFrame] = dict(self.input_dfs)
+        datasets: Dict[str, DataFrame] = dict(self.input_dfs)
         self.output_dfs.clear()
         for i, step in enumerate(steps):
             step_id   = step.get("id", str(i))
@@ -1675,7 +1676,7 @@ class DataFlowRunner:
             else:
                 LOG.warning("No DataFrame for output %s; skipping write", name)
 
-    def run(self) -> dict[str, DataFrame]:
+    def run(self) -> Dict[str, DataFrame]:
         """Full dataflow: load inputs → run transformations → write outputs."""
         self.load_inputs()
         self.run_transformations()
