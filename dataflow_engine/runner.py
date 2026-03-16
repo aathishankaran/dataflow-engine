@@ -1626,6 +1626,7 @@ class DataFlowRunner:
                 step_id=validate_step.get("id") or "validate",
                 ctrl_file_name=ctrl_file_name,
                 include_header=ctrl_include_hdr,
+                file_metadata=self._file_metadata,
             )
         except Exception as exc:
             LOG.warning(

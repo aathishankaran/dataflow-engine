@@ -41,9 +41,8 @@ def _extract_holiday_dates(usa_holidays) -> list:
 
 
 def _get_previous_business_day(holidays=None, reference_date=None) -> "date":
-    """Return the previous calendar day before *reference_date* (defaults to today),
-    skipping only dates listed in the supplied holidays.
-    Weekends are treated as valid days — files are loaded every day of the week.
+    """Return the previous business day before *reference_date* (defaults to today),
+    skipping weekends (Saturday, Sunday) and dates listed in the supplied holidays.
 
     Args:
         holidays: List of ISO date strings OR list of dicts {active, name, date}.
@@ -52,7 +51,7 @@ def _get_previous_business_day(holidays=None, reference_date=None) -> "date":
     from datetime import date, timedelta
     holiday_set: Set[str] = set(_extract_holiday_dates(holidays))
     d = (reference_date or date.today()) - timedelta(days=1)
-    while d.isoformat() in holiday_set:
+    while d.weekday() >= 5 or d.isoformat() in holiday_set:
         d -= timedelta(days=1)
     return d
 
@@ -628,6 +627,54 @@ def _raise_record_count_check_incident(
         LOG.warning("[INCIDENT] Failed to create record-count-check incident: %s", exc)
 
 
+def _resolve_metadata_refs(expression: str, file_metadata: dict) -> str:
+    """Replace ``first(FIELD_NAME)`` references with literal values from file metadata.
+
+    When the config-engine UI uses the *effective_date* or *as_of_date* presets
+    the stored expression contains ``first(INP-HDR-FILE-DATE)`` or
+    ``last_day(to_date(first(INP-HDR-FILE-DATE),'yyyyMMdd'))``.  The DataFrame
+    passed to :func:`_create_ctrl_file` only has *data* rows — headers are
+    stripped by ``runner.py._load_fixed_width_input``.  This helper resolves
+    the ``first(FIELD)`` references by looking up the actual value from
+    ``file_metadata`` (populated from the header/trailer rows at load time).
+
+    Compound expressions resolve naturally because only the inner ``first()``
+    call is replaced, leaving outer functions intact as valid Spark SQL.
+    """
+    if not file_metadata or "first(" not in expression:
+        return expression
+
+    def _replace_first_ref(match: "re.Match") -> str:
+        raw_field = match.group(1).strip()
+        # runner.py normalises hyphens → underscores in metadata keys
+        norm_field = raw_field.replace("-", "_")
+        for _meta_key, meta_vals in file_metadata.items():
+            if not isinstance(meta_vals, dict):
+                continue
+            # Try normalised name first, then raw (use 'in' to handle empty-string values)
+            if norm_field in meta_vals:
+                val = meta_vals[norm_field]
+            elif raw_field in meta_vals:
+                val = meta_vals[raw_field]
+            else:
+                continue
+            escaped = str(val).replace("'", "\\'")
+            LOG.debug("[CTRL_FILE] Resolved first(%s) → '%s' from %s", raw_field, escaped, _meta_key)
+            return "'" + escaped + "'"
+        LOG.warning(
+            "[CTRL_FILE] Could not resolve field '%s' (norm='%s') from file_metadata: %s",
+            raw_field, norm_field,
+            {k: list(v.keys()) if isinstance(v, dict) else type(v).__name__
+             for k, v in file_metadata.items()},
+        )
+        return match.group(0)  # leave unchanged — Spark will give a clear error
+
+    resolved = re.sub(r'\bfirst\(([^)]+)\)', _replace_first_ref, expression)
+    if resolved != expression:
+        LOG.info("[CTRL_FILE] Resolved expression: '%s' → '%s'", expression, resolved)
+    return resolved
+
+
 def _create_ctrl_file(
     df: "DataFrame",
     ctrl_file_fields: List[dict],
@@ -635,6 +682,7 @@ def _create_ctrl_file(
     step_id: str = "validate",
     ctrl_file_name: str = "",
     include_header: bool = False,
+    file_metadata: Optional[dict] = None,
 ) -> None:
     """
     Compute control file field values from PySpark expressions and write
@@ -704,7 +752,8 @@ def _create_ctrl_file(
             begin      = int(field_def.get("begin") or 0)
             fmt        = (field_def.get("format") or "").strip()
             just_right = bool(field_def.get("just_right", False))
-            agg_exprs.append(F.expr(expression).alias(name))
+            resolved_expr = _resolve_metadata_refs(expression, file_metadata or {})
+            agg_exprs.append(F.expr(resolved_expr).alias(name))
             field_specs.append((name, ftype, length, begin, fmt, just_right))
 
         if not agg_exprs:
@@ -1506,6 +1555,7 @@ class MainframeTransformationExecutor:
         # present in older configs; otherwise fall back to validated_path.
         _explicit_ctrl_path = (logic.get("ctrl_output_path") or "").strip()
         ctrl_output_path    = _explicit_ctrl_path or validated_path
+
         # Apply frequency/date partition to ctrl_output_path when it differs
         # from validated_path (validated_path already has partition applied above)
         if _explicit_ctrl_path and _frequency:
@@ -1548,7 +1598,7 @@ class MainframeTransformationExecutor:
                 _expected_date = _get_previous_business_day(_holidays)
                 from datetime import date as _dt_date
                 LOG.info(
-                    "[VALIDATE] last_run_check: today=%s  expected_prev=%s  (holidays=%d)",
+                    "[VALIDATE] last_run_check: today=%s  expected_prev=%s  (holidays=%d, weekends skipped)",
                     _dt_date.today().isoformat(), _expected_date.isoformat(), len(_holidays),
                 )
                 # Build the previous day file path (resolve source dataset name as fallback).
@@ -2104,7 +2154,7 @@ class MainframeTransformationExecutor:
                     valid_count, validated_path
                 )
             if ctrl_file_create and ctrl_output_path:
-                _create_ctrl_file(valid_df, ctrl_file_fields, ctrl_output_path, step_id, ctrl_file_name, ctrl_include_header)
+                _create_ctrl_file(valid_df, ctrl_file_fields, ctrl_output_path, step_id, ctrl_file_name, ctrl_include_header, file_metadata=_file_metadata)
             return valid_df
 
         # Build annotated DataFrame for FLAG / ABORT
@@ -2156,7 +2206,7 @@ class MainframeTransformationExecutor:
                     valid_count, validated_path,
                 )
             if ctrl_file_create and ctrl_output_path:
-                _create_ctrl_file(df, ctrl_file_fields, ctrl_output_path, step_id, ctrl_file_name, ctrl_include_header)
+                _create_ctrl_file(df, ctrl_file_fields, ctrl_output_path, step_id, ctrl_file_name, ctrl_include_header, file_metadata=_file_metadata)
             return df
 
         # Default: FLAG — annotate rows, but abort if any are invalid.
@@ -2200,5 +2250,5 @@ class MainframeTransformationExecutor:
                 valid_count, validated_path
             )
         if ctrl_file_create and ctrl_output_path:
-            _create_ctrl_file(df, ctrl_file_fields, ctrl_output_path, step_id, ctrl_file_name, ctrl_include_header)
+            _create_ctrl_file(df, ctrl_file_fields, ctrl_output_path, step_id, ctrl_file_name, ctrl_include_header, file_metadata=_file_metadata)
         return annotated
