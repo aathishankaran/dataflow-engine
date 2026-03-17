@@ -1131,6 +1131,10 @@ class MainframeTransformationExecutor:
             result = self._apply_validate(source_df, logic)
         elif step_type == "select":
             result = self._apply_select(source_df, logic)
+        elif step_type == "ctrl_file":
+            step_id = step.get("id") or alias
+            self._apply_ctrl_file(source_df, logic, step_id)
+            result = source_df   # pass-through so alias remains resolvable
         elif step_type == "oracle_write":
             # Oracle Write is a terminal sink — loads data into Oracle via SQL*Loader.
             # The source DataFrame is passed through unchanged so downstream steps
@@ -1473,13 +1477,6 @@ class MainframeTransformationExecutor:
         Optional path fields (from logic dict):
           error_path        – path to write invalid rows (s3:// or local)
           validated_path    – path to write valid rows (s3:// or local)
-          ctrl_file_create  – True to generate a control file after validation
-          ctrl_file_name    – filename for the control file (e.g. USB.HOGON.TRAN.CTL);
-                              the file is written to validated_path automatically
-          ctrl_output_path  – (legacy) explicit path override; if absent the control
-                              file is co-located with validated_path
-          ctrl_file_fields  – list of {name, type, expression} dicts driving the
-                              control file content (PySpark agg expressions)
 
         On validation failure (invalid_count > 0), a MoogSoft/ServiceNow incident
         is raised automatically if MOOGSOFT_ENDPOINT / MOOGSOFT_API_KEY are configured.
@@ -1544,23 +1541,6 @@ class MainframeTransformationExecutor:
                 validated_path = _bpp(validated_path, "", _frequency, _partition_col)
             if error_path:
                 error_path = _bpp(error_path, "", _frequency, _partition_col)
-
-        # ── Control File Creation ────────────────────────────────────────────
-        ctrl_file_create  = bool(logic.get("ctrl_file_create", False))
-        ctrl_file_name    = (logic.get("ctrl_file_name")   or "").strip()
-        ctrl_file_fields  = logic.get("ctrl_file_fields") or []
-        ctrl_include_header = bool(logic.get("ctrl_include_header", False))
-        # The control file is co-located with the validated output data.
-        # For backward-compat we still honour an explicit ctrl_output_path when
-        # present in older configs; otherwise fall back to validated_path.
-        _explicit_ctrl_path = (logic.get("ctrl_output_path") or "").strip()
-        ctrl_output_path    = _explicit_ctrl_path or validated_path
-
-        # Apply frequency/date partition to ctrl_output_path when it differs
-        # from validated_path (validated_path already has partition applied above)
-        if _explicit_ctrl_path and _frequency:
-            from .config_loader import _build_partitioned_path as _bpp
-            ctrl_output_path = _bpp(_explicit_ctrl_path, "", _frequency, _partition_col)
 
         # ── Last Run / Previous Day File Check ───────────────────────────────
         # Supports both new `previous_day_check` (auto-derived) and legacy
@@ -2153,8 +2133,6 @@ class MainframeTransformationExecutor:
                     "[VALIDATE] Wrote %d valid row(s) to validated path: %s",
                     valid_count, validated_path
                 )
-            if ctrl_file_create and ctrl_output_path:
-                _create_ctrl_file(valid_df, ctrl_file_fields, ctrl_output_path, step_id, ctrl_file_name, ctrl_include_header, file_metadata=_file_metadata)
             return valid_df
 
         # Build annotated DataFrame for FLAG / ABORT
@@ -2205,8 +2183,6 @@ class MainframeTransformationExecutor:
                     "[VALIDATE] ABORT: wrote %d valid row(s) to validated path: %s",
                     valid_count, validated_path,
                 )
-            if ctrl_file_create and ctrl_output_path:
-                _create_ctrl_file(df, ctrl_file_fields, ctrl_output_path, step_id, ctrl_file_name, ctrl_include_header, file_metadata=_file_metadata)
             return df
 
         # Default: FLAG — annotate rows, but abort if any are invalid.
@@ -2249,6 +2225,55 @@ class MainframeTransformationExecutor:
                 "[VALIDATE] Wrote %d valid row(s) to validated path: %s",
                 valid_count, validated_path
             )
-        if ctrl_file_create and ctrl_output_path:
-            _create_ctrl_file(df, ctrl_file_fields, ctrl_output_path, step_id, ctrl_file_name, ctrl_include_header, file_metadata=_file_metadata)
         return annotated
+
+    # ── Control File step ──────────────────────────────────────────────
+    def _apply_ctrl_file(self, df: DataFrame, logic: dict, step_id: str) -> None:
+        """
+        Standalone control file creation step.  Reads ctrl_file_fields from
+        the step logic, resolves the output path, and delegates to the shared
+        ``_create_ctrl_file`` utility.
+
+        The source DataFrame is **not** transformed — it is passed through
+        unchanged so downstream steps can still reference the same alias.
+        """
+        ctrl_file_name    = (logic.get("ctrl_file_name") or "").strip()
+        ctrl_file_fields  = logic.get("ctrl_file_fields") or []
+        ctrl_include_hdr  = bool(logic.get("ctrl_include_header", False))
+
+        if not ctrl_file_fields:
+            LOG.warning("[CTRL_FILE:%s] No ctrl_file_fields in step logic; skipping.", step_id)
+            return
+
+        # Determine output path — prefer explicit, else derive from settings
+        _file_metadata = getattr(self, "_file_metadata", None) or logic.get("_file_metadata")
+
+        # Build the ctrl output path from the validated/curated bucket path
+        # similar to how _apply_validate did it.
+        _explicit_path = (logic.get("ctrl_output_path") or "").strip()
+        _validated_path = (logic.get("validated_path") or "").strip()
+        ctrl_output_path = _explicit_path or _validated_path
+
+        if not ctrl_output_path:
+            LOG.warning(
+                "[CTRL_FILE:%s] No output path could be resolved; skipping ctrl file.",
+                step_id,
+            )
+            return
+
+        # Apply frequency/date partition if needed
+        _frequency = (logic.get("frequency") or "").upper()
+        if _frequency and _explicit_path:
+            try:
+                from .config_loader import _build_partitioned_path as _bpp
+                _partition_col = logic.get("partition_column") or "load_date()"
+                ctrl_output_path = _bpp(_explicit_path, "", _frequency, _partition_col)
+            except Exception:
+                pass  # fall back to unpartitioned path
+
+        LOG.info("[CTRL_FILE:%s] Creating control file at '%s'", step_id, ctrl_output_path)
+        _create_ctrl_file(
+            df, ctrl_file_fields, ctrl_output_path, step_id,
+            ctrl_file_name, ctrl_include_hdr,
+            file_metadata=_file_metadata,
+        )

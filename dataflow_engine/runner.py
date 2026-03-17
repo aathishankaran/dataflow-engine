@@ -1576,37 +1576,42 @@ class DataFlowRunner:
         source_inputs = output_cfg.get("source_inputs") or []
         steps = (self.config.get("Transformations") or {}).get("steps") or []
 
-        # Find a validate step with ctrl_file_create=True.
+        # Find a ctrl_file step or a legacy validate step with ctrl_file_create.
         # Prefer one whose output_alias appears in this output's source_inputs;
-        # fall back to any validate step that ran in this pipeline (present in
-        # output_dfs).  This handles the common case where source_inputs points
-        # to the original input alias rather than the validate step alias.
-        validate_step = None
+        # fall back to any matching step that ran in this pipeline.
+        ctrl_step = None
         for step in steps:
-            if (step.get("type") or "").lower() != "validate":
-                continue
+            step_type = (step.get("type") or "").lower()
             logic = step.get("logic") or {}
-            if not logic.get("ctrl_file_create"):
-                continue
-            step_alias = step.get("output_alias") or step.get("id", "")
-            if step_alias in source_inputs:
-                validate_step = step
-                break                   # exact source_inputs match — highest priority
-            if step_alias in self.output_dfs:
-                validate_step = step    # pipeline ran this step — keep as candidate
+            # New: standalone ctrl_file step
+            if step_type == "ctrl_file" and logic.get("ctrl_file_fields"):
+                step_alias = step.get("output_alias") or step.get("id", "")
+                if step_alias in source_inputs:
+                    ctrl_step = step
+                    break
+                if step_alias in self.output_dfs:
+                    ctrl_step = step
+            # Legacy: validate step with ctrl_file_create
+            elif step_type == "validate" and logic.get("ctrl_file_create"):
+                step_alias = step.get("output_alias") or step.get("id", "")
+                if step_alias in source_inputs:
+                    ctrl_step = step
+                    break
+                if step_alias in self.output_dfs:
+                    ctrl_step = step
 
-        if validate_step is None:
+        if ctrl_step is None:
             return
 
-        logic            = validate_step.get("logic") or {}
+        logic            = ctrl_step.get("logic") or {}
         ctrl_file_name   = (logic.get("ctrl_file_name")   or "").strip()
         ctrl_file_fields = logic.get("ctrl_file_fields") or []
         ctrl_include_hdr = bool(logic.get("ctrl_include_header", False))
         if not ctrl_file_name or not ctrl_file_fields:
             LOG.debug(
                 "[CURATED_CTRL] ctrl_file_name or ctrl_file_fields not "
-                "set on validate step '%s'; skipping curated ctrl file.",
-                validate_step.get("id"),
+                "set on step '%s'; skipping curated ctrl file.",
+                ctrl_step.get("id"),
             )
             return
 
@@ -1623,7 +1628,7 @@ class DataFlowRunner:
                 df,
                 ctrl_file_fields,
                 curated_path,
-                step_id=validate_step.get("id") or "validate",
+                step_id=ctrl_step.get("id") or "ctrl_file",
                 ctrl_file_name=ctrl_file_name,
                 include_header=ctrl_include_hdr,
                 file_metadata=self._file_metadata,

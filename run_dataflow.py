@@ -54,6 +54,9 @@ def _build_spark_session(master: str) -> SparkSession:
         .appName("dataflow_engine")
         .master(master)
         .config("spark.sql.legacy.timeParserPolicy", "LEGACY")
+        .config("spark.sql.shuffle.partitions", "2")
+        .config("spark.default.parallelism", "2")
+        .config("spark.ui.showConsoleProgress", "false")
         # Ensure PySpark workers use the same Python interpreter
         .config("spark.pyspark.python",        sys.executable)
         .config("spark.pyspark.driver.python", sys.executable)
