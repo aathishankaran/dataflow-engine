@@ -108,26 +108,27 @@ def _build_spark_session(master: str) -> SparkSession:
 
     else:
         # ── Linux (default production environment) ─────────────────────────
-        # pip-installed PySpark does NOT bundle hadoop-aws.jar or
-        # aws-java-sdk-bundle.jar, so S3AFileSystem is missing from the JVM
-        # classpath.  Resolve the correct versions to match the Hadoop build
-        # bundled with the installed PySpark release, then let Spark pull them
-        # from Maven on first run (cached in ~/.ivy2 on subsequent runs).
+        # hadoop-aws and aws-java-sdk-bundle JARs must be pre-installed into
+        # PySpark's jars/ directory before starting the engine.  Run the
+        # one-time setup script:
+        #   python install_s3_jars.py
+        # Then re-run this script.  No internet access is needed at runtime.
         import pyspark as _pyspark
-        _pv = tuple(int(x) for x in _pyspark.__version__.split(".")[:2])
-        # PySpark 3.0–3.1 → Hadoop 3.2.0 ; PySpark 3.2+ → Hadoop 3.3.x
-        _hadoop_aws_ver = "3.3.1" if _pv >= (3, 2) else "3.2.0"
-        _aws_sdk_ver    = "1.11.901" if _pv >= (3, 2) else "1.11.375"
-        builder = builder.config(
-            "spark.jars.packages",
-            "org.apache.hadoop:hadoop-aws:{hv},com.amazonaws:aws-java-sdk-bundle:{sv}".format(
-                hv=_hadoop_aws_ver, sv=_aws_sdk_ver
-            ),
-        )
-        LOG.info(
-            "Linux: added S3A packages hadoop-aws:%s / aws-java-sdk-bundle:%s",
-            _hadoop_aws_ver, _aws_sdk_ver,
-        )
+        _spark_jars_dir = Path(_pyspark.__file__).parent / "jars"
+        _missing = [
+            j for j in ("hadoop-aws", "aws-java-sdk-bundle")
+            if not any(_spark_jars_dir.glob(j + "-*.jar"))
+        ]
+        if _missing:
+            LOG.error(
+                "Linux: required S3A JARs not found in %s: %s\n"
+                "  Run:  python install_s3_jars.py",
+                _spark_jars_dir, ", ".join(_missing),
+            )
+            raise RuntimeError(
+                "S3A JARs missing – run 'python install_s3_jars.py' first."
+            )
+        LOG.info("Linux: S3A JARs present in %s", _spark_jars_dir)
 
     return builder.getOrCreate()
 
