@@ -162,8 +162,6 @@ def _configure_s3_if_needed(spark: SparkSession, path: str) -> None:
         return
     hadoop_conf = spark.sparkContext._jsc.hadoopConfiguration()  # type: ignore[attr-defined]
 
-    region = os.environ.get("AWS_REGION", "us-east-1")
-
     # ── FileSystem implementation ──────────────────────────────────────────
     # fs.s3a.impl MUST be set explicitly — all paths are normalised to s3a://
     # by _effective_path(), so Hadoop looks up fs.s3a.impl at read/write time.
@@ -174,7 +172,11 @@ def _configure_s3_if_needed(spark: SparkSession, path: str) -> None:
     hadoop_conf.set("fs.s3n.impl",  "org.apache.hadoop.fs.s3a.S3AFileSystem")
 
     # ── Endpoint ───────────────────────────────────────────────────────────
-    hadoop_conf.set("fs.s3a.endpoint", "s3.{}.amazonaws.com".format(region))
+    # Do NOT set fs.s3a.endpoint on AWS — S3A defaults to the global endpoint
+    # (s3.amazonaws.com) which handles cross-region routing automatically.
+    # Hardcoding a regional endpoint (e.g. s3.us-east-1.amazonaws.com) causes
+    # hadoop-aws to hang when the bucket lives in a different region because
+    # aws-java-sdk-bundle 1.11.x does not follow S3 cross-region redirects.
 
     # ── Credentials — EC2 IAM instance profile ─────────────────────────────
     # DefaultAWSCredentialsProviderChain automatically picks up the IAM role
@@ -424,21 +426,20 @@ class DataFlowRunner:
         )
 
         # ── 2. Skip header / trailer lines ───────────────────────────────────
-        # Use pure DataFrame window functions — no RDD, no Python lambda, no
-        # cloudpickle serialisation.  monotonically_increasing_id() gives a
-        # per-partition row sequence that is stable for single-partition local
-        # files (0, 1, 2 …) and preserves block-read order for multi-partition
-        # S3/HDFS files when used as a sort key for row_number().
+        # coalesce(1) merges all partitions into one without a shuffle so
+        # monotonically_increasing_id() then produces a globally sequential
+        # 0-based row number — no Window, no sort, no full shuffle.
+        #
+        # Window.partitionBy(lit(1)).orderBy(monotonically_increasing_id())
+        # was removed: it forced ALL rows into a single partition via an
+        # expensive global sort/shuffle that caused the job to hang on
+        # large S3 files.
         raw_df_indexed: Optional[DataFrame] = None
         total_lines: Optional[int] = None
         if header_count > 0 or trailer_count > 0:
-            from pyspark.sql.window import Window as _Window
-            raw_df_indexed = raw_df.withColumn(
-                "_rn",
-                F.row_number().over(
-                    _Window.partitionBy(F.lit(1)).orderBy(F.monotonically_increasing_id())
-                ) - 1,
-            )  # 0-based row number
+            raw_df_indexed = raw_df.coalesce(1).withColumn(
+                "_rn", F.monotonically_increasing_id()
+            )  # 0-based sequential row number within the single partition
             keep_from = header_count
             if trailer_count > 0:
                 total_lines = raw_df_indexed.count()
