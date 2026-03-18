@@ -589,8 +589,10 @@ class DataFlowRunner:
             # Spark's substring() never requests bytes beyond the buffer capacity
             # (avoids java.lang.IllegalArgumentException: newLimit > capacity).
             if fields:
+                # Spark internally computes newLimit = start + length (1-based),
+                # so the buffer must hold at least start + length characters.
                 _max_pos = max(
-                    int(f.get("start") or 1) + int(f.get("length") or 1) - 1
+                    int(f.get("start") or 1) + int(f.get("length") or 1)
                     for f in fields
                 )
                 if _max_pos > 0:
