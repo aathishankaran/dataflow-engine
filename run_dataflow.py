@@ -16,9 +16,9 @@ Environment variables (optional):
     JAVA_HOME           – path to JDK (required for Spark)
     HADOOP_HOME         – path to Hadoop / winutils.exe directory (Windows only)
     SPARK_LOCAL_DIRS    – override Spark local scratch directory
-    AWS_ACCESS_KEY_ID   – explicit AWS key (use IAM roles instead in production)
-    AWS_SECRET_ACCESS_KEY
-    AWS_REGION          – default us-east-1
+    AWS_REGION          – S3 region for the endpoint (default: us-east-1)
+                          credentials are sourced automatically from the EC2
+                          IAM instance profile — no access keys required
     S3_JARS_DIR         – (Linux) directory containing hadoop-aws and
                           aws-java-sdk-bundle JARs (default: PySpark's jars/ dir)
 """

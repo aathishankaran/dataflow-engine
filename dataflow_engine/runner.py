@@ -152,20 +152,16 @@ def _configure_s3_if_needed(spark: SparkSession, path: str) -> None:
     """
     Apply S3 / hadoop-aws configuration when the path points to S3.
 
-    Reads credentials from environment variables (compatible with AWS IAM roles,
-    ~/.aws/credentials, and explicit key/secret pairs):
-      AWS_ACCESS_KEY_ID      – optional explicit key (omitted when using IAM role)
-      AWS_SECRET_ACCESS_KEY  – optional explicit secret
-      AWS_SESSION_TOKEN      – optional session token
-      AWS_REGION             – optional region (default: us-east-1)
+    Credentials are resolved automatically via the EC2 IAM instance profile
+    attached to the machine — no explicit keys are required or read.
+
+    Optional environment variable:
+      AWS_REGION  – AWS region for the S3 endpoint (default: us-east-1)
     """
     if not _is_s3_path(path):
         return
     hadoop_conf = spark.sparkContext._jsc.hadoopConfiguration()  # type: ignore[attr-defined]
 
-    key    = os.environ.get("AWS_ACCESS_KEY_ID", "")
-    secret = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
-    token  = os.environ.get("AWS_SESSION_TOKEN", "")
     region = os.environ.get("AWS_REGION", "us-east-1")
 
     # ── FileSystem implementation ──────────────────────────────────────────
@@ -180,26 +176,14 @@ def _configure_s3_if_needed(spark: SparkSession, path: str) -> None:
     # ── Endpoint ───────────────────────────────────────────────────────────
     hadoop_conf.set("fs.s3a.endpoint", "s3.{}.amazonaws.com".format(region))
 
-    # ── Credentials provider ───────────────────────────────────────────────
-    # Use SimpleAWSCredentialsProvider when explicit keys are supplied so
-    # Hadoop goes straight to the provided values without attempting the full
-    # credential-chain lookup (which adds latency and can hang in corporate
-    # networks that block instance-metadata requests).
-    if key and secret:
-        hadoop_conf.set(
-            "fs.s3a.aws.credentials.provider",
-            "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider",
-        )
-        hadoop_conf.set("fs.s3a.access.key", key)
-        hadoop_conf.set("fs.s3a.secret.key", secret)
-        if token:
-            hadoop_conf.set("fs.s3a.session.token", token)
-    else:
-        # IAM role / ~/.aws/credentials / environment-variable chain
-        hadoop_conf.set(
-            "fs.s3a.aws.credentials.provider",
-            "com.amazonaws.auth.DefaultAWSCredentialsProviderChain",
-        )
+    # ── Credentials — EC2 IAM instance profile ─────────────────────────────
+    # DefaultAWSCredentialsProviderChain automatically picks up the IAM role
+    # attached to the EC2 instance via the instance metadata service
+    # (169.254.169.254) — no access keys are needed or configured.
+    hadoop_conf.set(
+        "fs.s3a.aws.credentials.provider",
+        "com.amazonaws.auth.DefaultAWSCredentialsProviderChain",
+    )
 
     # ── Connection timeouts (prevent indefinite hangs) ─────────────────────
     # Default Hadoop S3A timeouts are very long; tighten them so a mis-
