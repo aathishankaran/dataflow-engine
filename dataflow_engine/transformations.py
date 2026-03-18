@@ -15,11 +15,23 @@ import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from pyspark.sql import DataFrame
+from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from .oracle_loader import write_df_to_oracle  # noqa: E402 — imported after std-lib
 
 LOG = logging.getLogger(__name__)
+
+
+def _spark_from_df(df: DataFrame) -> SparkSession:
+    """Return the SparkSession associated with a DataFrame.
+
+    DataFrame.sparkSession was added in PySpark 3.3.  On PySpark 3.1/3.2
+    (Python 3.6 compatible) use sql_ctx.sparkSession instead.
+    """
+    try:
+        return _spark_from_df(df)          # PySpark 3.3+
+    except AttributeError:
+        return df.sql_ctx.sparkSession  # PySpark 3.1 / 3.2
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -186,7 +198,7 @@ def _write_df_to_path(df: DataFrame, path: str, mode: str = "append", file_name:
            .option("sep", "|")
            .csv(tmp_s3))
         final_s3 = actual_path.rstrip("/") + "/" + file_name
-        _s3_rename_part_to_named(df.sparkSession, tmp_s3, final_s3, actual_path)
+        _s3_rename_part_to_named(_spark_from_df(df), tmp_s3, final_s3, actual_path)
         LOG.info("[VALIDATE_WRITE] Written '%s' to S3 path '%s'.", file_name, actual_path)
 
     else:
@@ -263,7 +275,7 @@ def _write_fixed_width_to_path(
         tmp_s3 = actual_path.rstrip("/") + "/_fw_tmp_" + file_name.replace(".", "_")
         df_fixed.coalesce(1).write.mode("overwrite").text(tmp_s3)
         final_s3 = actual_path.rstrip("/") + "/" + file_name
-        _s3_rename_part_to_named(df_fixed.sparkSession, tmp_s3, final_s3, actual_path)
+        _s3_rename_part_to_named(_spark_from_df(df_fixed), tmp_s3, final_s3, actual_path)
         LOG.info("[FIXED_WRITE] Written '%s' to S3 path '%s'.", file_name, actual_path)
     else:
         import platform as _platform
@@ -820,7 +832,7 @@ def _create_ctrl_file(
 
         # Wrap into a one-row Spark DataFrame so the existing write
         # infrastructure (S3 rename, local temp dir, etc.) is unchanged.
-        fixed_df = ctrl_df.sparkSession.range(1).select(F.lit(output_line).alias("value"))
+        fixed_df = _spark_from_df(ctrl_df).range(1).select(F.lit(output_line).alias("value"))
 
         # ── 3. Prepend header row if requested ────────────────────────────
         if include_header:
@@ -843,7 +855,7 @@ def _create_ctrl_file(
             # regardless of Spark partition ordering (plain .union() is unordered).
             # NOTE: select("__row_ord__", "value") ensures column order matches
             # header_df so .union() (which is positional) aligns correctly.
-            header_df = df.sparkSession.range(1).select(
+            header_df = _spark_from_df(df).range(1).select(
                 F.lit(0).alias("__row_ord__"),
                 F.lit(header_line).alias("value"),
             )
@@ -873,7 +885,7 @@ def _create_ctrl_file(
                 tmp_s3 = actual_path.rstrip("/") + "/_ctrl_tmp_" + step_id
                 fixed_df.coalesce(1).write.mode("overwrite").text(tmp_s3)
                 final_s3 = actual_path.rstrip("/") + "/" + ctrl_file_name
-                _s3_rename_part_to_named(fixed_df.sparkSession, tmp_s3, final_s3, actual_path)
+                _s3_rename_part_to_named(_spark_from_df(fixed_df), tmp_s3, final_s3, actual_path)
                 LOG.info("[CTRL_FILE:%s] Control file written to S3 path '%s'.", step_id, final_s3)
             else:
                 local_dir = Path(actual_path)
@@ -1656,7 +1668,7 @@ class MainframeTransformationExecutor:
                     else:
                         # S3 / HDFS — use the active Spark session via any loaded dataset
                         _spark_ds = next(iter(self.dfs.values()), None) if self.dfs else None
-                        _spark_ss = _spark_ds.sparkSession if _spark_ds is not None else None
+                        _spark_ss = _spark_from_df(_spark_ds) if _spark_ds is not None else None
                         if _spark_ss is None:
                             _msg = "[VALIDATE] No Spark session available to read previous day S3 file."
                             LOG.error(_msg)
