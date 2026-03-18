@@ -162,23 +162,52 @@ def _configure_s3_if_needed(spark: SparkSession, path: str) -> None:
     if not _is_s3_path(path):
         return
     hadoop_conf = spark.sparkContext._jsc.hadoopConfiguration()  # type: ignore[attr-defined]
-    # Use s3a:// (preferred) — re-write any legacy s3:// or s3n:// prefixes
+
     key    = os.environ.get("AWS_ACCESS_KEY_ID", "")
     secret = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
     token  = os.environ.get("AWS_SESSION_TOKEN", "")
     region = os.environ.get("AWS_REGION", "us-east-1")
 
-    hadoop_conf.set("fs.s3a.endpoint", f"s3.{region}.amazonaws.com")
-    hadoop_conf.set("fs.s3a.aws.credentials.provider",
-                    "com.amazonaws.auth.DefaultAWSCredentialsProviderChain")
+    # ── FileSystem implementation ──────────────────────────────────────────
+    # fs.s3a.impl MUST be set explicitly — all paths are normalised to s3a://
+    # by _effective_path(), so Hadoop looks up fs.s3a.impl at read/write time.
+    # Without this, Hadoop uses a different lookup path and cannot locate the
+    # class even when the JAR is in the classpath.
+    hadoop_conf.set("fs.s3a.impl",  "org.apache.hadoop.fs.s3a.S3AFileSystem")
+    hadoop_conf.set("fs.s3.impl",   "org.apache.hadoop.fs.s3a.S3AFileSystem")
+    hadoop_conf.set("fs.s3n.impl",  "org.apache.hadoop.fs.s3a.S3AFileSystem")
+
+    # ── Endpoint ───────────────────────────────────────────────────────────
+    hadoop_conf.set("fs.s3a.endpoint", "s3.{}.amazonaws.com".format(region))
+
+    # ── Credentials provider ───────────────────────────────────────────────
+    # Use SimpleAWSCredentialsProvider when explicit keys are supplied so
+    # Hadoop goes straight to the provided values without attempting the full
+    # credential-chain lookup (which adds latency and can hang in corporate
+    # networks that block instance-metadata requests).
     if key and secret:
+        hadoop_conf.set(
+            "fs.s3a.aws.credentials.provider",
+            "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider",
+        )
         hadoop_conf.set("fs.s3a.access.key", key)
         hadoop_conf.set("fs.s3a.secret.key", secret)
-    if token:
-        hadoop_conf.set("fs.s3a.session.token", token)
-    # Normalise s3:// / s3n:// → s3a:// for hadoop-aws compatibility
-    hadoop_conf.set("fs.s3.impl",  "org.apache.hadoop.fs.s3a.S3AFileSystem")
-    hadoop_conf.set("fs.s3n.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+        if token:
+            hadoop_conf.set("fs.s3a.session.token", token)
+    else:
+        # IAM role / ~/.aws/credentials / environment-variable chain
+        hadoop_conf.set(
+            "fs.s3a.aws.credentials.provider",
+            "com.amazonaws.auth.DefaultAWSCredentialsProviderChain",
+        )
+
+    # ── Connection timeouts (prevent indefinite hangs) ─────────────────────
+    # Default Hadoop S3A timeouts are very long; tighten them so a mis-
+    # configured endpoint or blocked port fails fast with a clear error
+    # instead of hanging the job silently.
+    hadoop_conf.set("fs.s3a.connection.establish.timeout", "5000")   # ms
+    hadoop_conf.set("fs.s3a.connection.timeout",           "10000")  # ms
+    hadoop_conf.set("fs.s3a.attempts.maximum",             "3")
 
 
 def _effective_path(path: str) -> str:

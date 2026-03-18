@@ -19,6 +19,8 @@ Environment variables (optional):
     AWS_ACCESS_KEY_ID   – explicit AWS key (use IAM roles instead in production)
     AWS_SECRET_ACCESS_KEY
     AWS_REGION          – default us-east-1
+    S3_JARS_DIR         – (Linux) directory containing hadoop-aws and
+                          aws-java-sdk-bundle JARs (default: PySpark's jars/ dir)
 """
 
 import argparse
@@ -108,27 +110,55 @@ def _build_spark_session(master: str) -> SparkSession:
 
     else:
         # ── Linux (default production environment) ─────────────────────────
-        # hadoop-aws and aws-java-sdk-bundle JARs must be pre-installed into
-        # PySpark's jars/ directory before starting the engine.  Run the
-        # one-time setup script:
-        #   python install_s3_jars.py
-        # Then re-run this script.  No internet access is needed at runtime.
+        # Explicitly load S3A JARs via spark.jars so Spark's classloader
+        # picks them up reliably (virtual-env safe).
+        # Set S3_JARS_DIR env var to the directory containing:
+        #   hadoop-aws-3.3.1.jar
+        #   aws-java-sdk-bundle-1.11.901.jar
         import pyspark as _pyspark
-        _spark_jars_dir = Path(_pyspark.__file__).parent / "jars"
-        _missing = [
-            j for j in ("hadoop-aws", "aws-java-sdk-bundle")
-            if not any(_spark_jars_dir.glob(j + "-*.jar"))
-        ]
+        _default_jars_dir = Path(_pyspark.__file__).parent / "jars"
+        _s3_jars_dir = Path(os.environ.get("S3_JARS_DIR", str(_default_jars_dir)))
+
+        _jar_paths = []
+        for _prefix in ("hadoop-aws", "aws-java-sdk-bundle"):
+            _found = sorted(_s3_jars_dir.glob(_prefix + "-*.jar"))
+            if not _found:
+                # fallback: check PySpark's own jars dir
+                _found = sorted(_default_jars_dir.glob(_prefix + "-*.jar"))
+            if _found:
+                _jar_paths.append(str(_found[-1]))  # pick latest if multiple
+
+        _missing = [p for p in ("hadoop-aws", "aws-java-sdk-bundle")
+                    if not any(p in j for j in _jar_paths)]
         if _missing:
             LOG.error(
-                "Linux: required S3A JARs not found in %s: %s\n"
-                "  Run:  python install_s3_jars.py",
-                _spark_jars_dir, ", ".join(_missing),
+                "Linux: S3A JARs not found for: %s\n"
+                "  Set S3_JARS_DIR to the directory containing "
+                "hadoop-aws-3.3.1.jar and aws-java-sdk-bundle-1.11.901.jar\n"
+                "  Example: export S3_JARS_DIR=/path/to/jars",
+                ", ".join(_missing),
             )
             raise RuntimeError(
-                "S3A JARs missing – run 'python install_s3_jars.py' first."
+                "S3A JARs missing – set S3_JARS_DIR and retry."
             )
-        LOG.info("Linux: S3A JARs present in %s", _spark_jars_dir)
+
+        # spark.driver.extraClassPath set via builder.config() is silently
+        # ignored when PySpark is started programmatically — the JVM classpath
+        # is fixed at JVM launch and cannot be extended afterwards.
+        # PYSPARK_SUBMIT_ARGS is read by PySpark before the JVM starts, so
+        # --driver-class-path here reaches the JVM system classloader that
+        # Hadoop's Configuration.getClass() uses to resolve S3AFileSystem.
+        # Must be set BEFORE builder.getOrCreate() is called.
+        _cp = ":".join(_jar_paths)
+        _existing = os.environ.get("PYSPARK_SUBMIT_ARGS", "pyspark-shell")
+        if "--driver-class-path" not in _existing:
+            # Insert --driver-class-path before the trailing "pyspark-shell"
+            _submit_args = _existing.replace(
+                "pyspark-shell",
+                "--driver-class-path {cp} pyspark-shell".format(cp=_cp),
+            )
+            os.environ["PYSPARK_SUBMIT_ARGS"] = _submit_args
+        LOG.info("Linux: PYSPARK_SUBMIT_ARGS set with S3A JARs: %s", _jar_paths)
 
     return builder.getOrCreate()
 
