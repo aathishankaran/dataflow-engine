@@ -571,6 +571,19 @@ class DataFlowRunner:
                     except Exception:
                         pass
 
+            # Pad every line to at least the maximum field end position so that
+            # Spark's substring() never requests bytes beyond the buffer capacity
+            # (avoids java.lang.IllegalArgumentException: newLimit > capacity).
+            if fields:
+                _max_pos = max(
+                    int(f.get("start") or 1) + int(f.get("length") or 1) - 1
+                    for f in fields
+                )
+                if _max_pos > 0:
+                    raw_df = raw_df.withColumn(
+                        "value", F.rpad(F.col("value"), _max_pos, " ")
+                    )
+
             # Auto-compute start positions when they are missing (sequential layout)
             auto_start = 1
             select_exprs = []
